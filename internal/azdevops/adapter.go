@@ -16,6 +16,13 @@ import (
 type Adapter struct {
 	mc *MultiClient
 
+	// qualifyScopeDisplay, when true, prefixes ScopeDisplay with the
+	// organisation name ("org/project") so multi-organisation list views can
+	// tell projects from different orgs apart. Identity.Scope stays the bare
+	// project API name for routing. Single-organisation configs leave this
+	// false so display is unchanged.
+	qualifyScopeDisplay bool
+
 	// notifStore, notifLookbackDays and notifSources back the
 	// provider.NotificationSource surface (adapter_notifications.go) only.
 	// A plain NewAdapter(mc) leaves every notification-related field below
@@ -109,6 +116,33 @@ func NewAdapter(mc *MultiClient) *Adapter {
 	return &Adapter{mc: mc}
 }
 
+// SetQualifyScopeDisplay enables or disables organisation-prefixing of
+// ScopeDisplay (see Adapter.qualifyScopeDisplay). Returns the adapter for
+// fluent construction in runTUI.
+func (a *Adapter) SetQualifyScopeDisplay(qualify bool) *Adapter {
+	if a != nil {
+		a.qualifyScopeDisplay = qualify
+	}
+	return a
+}
+
+// scopeDisplayFor returns the UI display string for a project scope,
+// optionally prefixed with the organisation name.
+func (a *Adapter) scopeDisplayFor(projectName, projectDisplayName string) string {
+	display := projectDisplayName
+	if display == "" {
+		display = projectName
+	}
+	if a == nil || !a.qualifyScopeDisplay || a.mc == nil {
+		return display
+	}
+	org := a.mc.GetOrg()
+	if org == "" {
+		return display
+	}
+	return org + "/" + display
+}
+
 // Kind returns the backend kind for this adapter.
 func (a *Adapter) Kind() provider.Kind {
 	return provider.KindAzure
@@ -148,7 +182,7 @@ func (a *Adapter) ListPullRequests(top int, opts provider.ListOpts) ([]provider.
 	}
 	result := make([]provider.PullRequest, len(wire))
 	for i, pr := range wire {
-		result[i] = MapPullRequest(pr, pr.ProjectName, pr.ProjectDisplayName)
+		result[i] = MapPullRequest(pr, pr.ProjectName, a.scopeDisplayFor(pr.ProjectName, pr.ProjectDisplayName))
 	}
 	return result, nil
 }
@@ -167,7 +201,7 @@ func (a *Adapter) ListMyPullRequests(top int, opts provider.ListOpts) ([]provide
 	}
 	result := make([]provider.PullRequest, len(wire))
 	for i, pr := range wire {
-		result[i] = MapPullRequest(pr, pr.ProjectName, pr.ProjectDisplayName)
+		result[i] = MapPullRequest(pr, pr.ProjectName, a.scopeDisplayFor(pr.ProjectName, pr.ProjectDisplayName))
 	}
 	return result, nil
 }
@@ -186,7 +220,7 @@ func (a *Adapter) ListPullRequestsAsReviewer(top int, opts provider.ListOpts) ([
 	}
 	result := make([]provider.PullRequest, len(wire))
 	for i, pr := range wire {
-		result[i] = MapPullRequest(pr, pr.ProjectName, pr.ProjectDisplayName)
+		result[i] = MapPullRequest(pr, pr.ProjectName, a.scopeDisplayFor(pr.ProjectName, pr.ProjectDisplayName))
 	}
 	return result, nil
 }
@@ -205,7 +239,7 @@ func (a *Adapter) GetPRThreads(scope, repositoryID string, pullRequestID int) ([
 	if err != nil {
 		return nil, err
 	}
-	scopeDisplay := a.mc.DisplayNameFor(scope)
+	scopeDisplay := a.scopeDisplayFor(scope, a.mc.DisplayNameFor(scope))
 	result := make([]provider.Thread, len(wire))
 	for i, t := range wire {
 		result[i] = MapThread(t, scope, scopeDisplay)
@@ -295,7 +329,7 @@ func (a *Adapter) AddPRCodeComment(scope, repositoryID string, pullRequestID int
 	if err != nil {
 		return nil, err
 	}
-	scopeDisplay := a.mc.DisplayNameFor(scope)
+	scopeDisplay := a.scopeDisplayFor(scope, a.mc.DisplayNameFor(scope))
 	mapped := MapThread(*wire, scope, scopeDisplay)
 	return &mapped, nil
 }
@@ -314,7 +348,7 @@ func (a *Adapter) AddPRComment(scope, repositoryID string, pullRequestID int, co
 	if err != nil {
 		return nil, err
 	}
-	scopeDisplay := a.mc.DisplayNameFor(scope)
+	scopeDisplay := a.scopeDisplayFor(scope, a.mc.DisplayNameFor(scope))
 	mapped := MapThread(*wire, scope, scopeDisplay)
 	return &mapped, nil
 }
@@ -333,7 +367,7 @@ func (a *Adapter) ReplyToThread(scope, repositoryID string, pullRequestID int, t
 	if err != nil {
 		return nil, err
 	}
-	scopeDisplay := a.mc.DisplayNameFor(scope)
+	scopeDisplay := a.scopeDisplayFor(scope, a.mc.DisplayNameFor(scope))
 	mapped := MapComment(*wire, scope, scopeDisplay)
 	return &mapped, nil
 }
@@ -368,7 +402,7 @@ func (a *Adapter) ListWorkItems(top int, opts provider.ListOpts) ([]provider.Wor
 	}
 	result := make([]provider.WorkItem, len(wire))
 	for i, wi := range wire {
-		result[i] = MapWorkItem(wi, wi.ProjectName, wi.ProjectDisplayName)
+		result[i] = MapWorkItem(wi, wi.ProjectName, a.scopeDisplayFor(wi.ProjectName, wi.ProjectDisplayName))
 	}
 	return result, nil
 }
@@ -387,7 +421,7 @@ func (a *Adapter) ListMyWorkItems(top int, opts provider.ListOpts) ([]provider.W
 	}
 	result := make([]provider.WorkItem, len(wire))
 	for i, wi := range wire {
-		result[i] = MapWorkItem(wi, wi.ProjectName, wi.ProjectDisplayName)
+		result[i] = MapWorkItem(wi, wi.ProjectName, a.scopeDisplayFor(wi.ProjectName, wi.ProjectDisplayName))
 	}
 	return result, nil
 }
@@ -440,7 +474,7 @@ func (a *Adapter) GetWorkItemComments(scope string, id int) ([]provider.WorkItem
 	if err != nil {
 		return nil, err
 	}
-	scopeDisplay := a.mc.DisplayNameFor(scope)
+	scopeDisplay := a.scopeDisplayFor(scope, a.mc.DisplayNameFor(scope))
 	result := make([]provider.WorkItemComment, len(wire))
 	for i, wc := range wire {
 		result[i] = MapWorkItemComment(wc, scope, scopeDisplay)
@@ -462,7 +496,7 @@ func (a *Adapter) AddWorkItemComment(scope string, id int, text string) (*provid
 	if err != nil {
 		return nil, err
 	}
-	scopeDisplay := a.mc.DisplayNameFor(scope)
+	scopeDisplay := a.scopeDisplayFor(scope, a.mc.DisplayNameFor(scope))
 	mapped := MapWorkItemComment(*wire, scope, scopeDisplay)
 	return &mapped, nil
 }
@@ -483,7 +517,7 @@ func (a *Adapter) ListPipelineRuns(top int, opts provider.ListOpts) ([]provider.
 	}
 	result := make([]provider.PipelineRun, len(wire))
 	for i, p := range wire {
-		result[i] = MapPipelineRun(p, p.ProjectName, p.ProjectDisplayName)
+		result[i] = MapPipelineRun(p, p.ProjectName, a.scopeDisplayFor(p.ProjectName, p.ProjectDisplayName))
 	}
 	return result, nil
 }
@@ -502,7 +536,7 @@ func (a *Adapter) GetBuildTimeline(scope string, buildID int) (*provider.Timelin
 	if err != nil {
 		return nil, err
 	}
-	scopeDisplay := a.mc.DisplayNameFor(scope)
+	scopeDisplay := a.scopeDisplayFor(scope, a.mc.DisplayNameFor(scope))
 	mapped := MapTimeline(*wire, scope, scopeDisplay)
 	return &mapped, nil
 }

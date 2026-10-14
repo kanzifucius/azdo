@@ -1731,3 +1731,227 @@ github:
 		t.Errorf("GitHub.PriorityPrefix = %q, want priority:", cfg.GitHub.PriorityPrefix)
 	}
 }
+
+func TestLoad_Organizations_Multiple(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	content := `organizations:
+  - name: org-a
+    projects:
+      - proj-a
+      - name: ugly-api
+        display_name: Pretty A
+  - name: org-b
+    projects:
+      - proj-b
+polling_interval: 60
+theme: dark
+`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := LoadFrom(configPath)
+	if err != nil {
+		t.Fatalf("LoadFrom() failed: %v", err)
+	}
+	if !cfg.HasAzure() {
+		t.Fatal("HasAzure() = false, want true")
+	}
+	if !cfg.IsMultiOrganization() {
+		t.Error("IsMultiOrganization() = false, want true")
+	}
+	if !cfg.IsMultiProject() {
+		t.Error("IsMultiProject() = false, want true")
+	}
+	if len(cfg.Organizations) != 2 {
+		t.Fatalf("Organizations len = %d, want 2", len(cfg.Organizations))
+	}
+	if cfg.Organizations[0].Name != "org-a" || cfg.Organizations[1].Name != "org-b" {
+		t.Errorf("org names = %q, %q", cfg.Organizations[0].Name, cfg.Organizations[1].Name)
+	}
+	if got := cfg.DisplayNameFor("ugly-api"); got != "Pretty A" {
+		t.Errorf("DisplayNameFor(ugly-api) = %q, want Pretty A", got)
+	}
+	if cfg.OrgForProject("proj-b") != "org-b" {
+		t.Errorf("OrgForProject(proj-b) = %q, want org-b", cfg.OrgForProject("proj-b"))
+	}
+	// Legacy fields mirror the first organisation.
+	if cfg.Organization != "org-a" {
+		t.Errorf("Organization = %q, want org-a (first org)", cfg.Organization)
+	}
+	if cfg.OrganizationLabel() != "org-a, org-b" {
+		t.Errorf("OrganizationLabel() = %q, want %q", cfg.OrganizationLabel(), "org-a, org-b")
+	}
+}
+
+func TestLoad_Organizations_LegacyStillWorks(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	content := `organization: legacy-org
+projects:
+  - p1
+polling_interval: 60
+theme: dark
+`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	cfg, err := LoadFrom(configPath)
+	if err != nil {
+		t.Fatalf("LoadFrom: %v", err)
+	}
+	if len(cfg.Organizations) != 1 || cfg.Organizations[0].Name != "legacy-org" {
+		t.Fatalf("Organizations = %+v, want one entry legacy-org", cfg.Organizations)
+	}
+	if cfg.azureYAMLShape != "legacy" {
+		t.Errorf("azureYAMLShape = %q, want legacy", cfg.azureYAMLShape)
+	}
+}
+
+func TestLoad_Organizations_BothShapes_Error(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	content := `organization: legacy-org
+projects:
+  - p1
+organizations:
+  - name: org-a
+    projects:
+      - p2
+polling_interval: 60
+theme: dark
+`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_, err := LoadFrom(configPath)
+	if err == nil {
+		t.Fatal("LoadFrom() succeeded, want error for both shapes")
+	}
+	if !strings.Contains(err.Error(), "organizations") || !strings.Contains(err.Error(), "legacy") {
+		t.Errorf("error = %v, want mention of both shapes", err)
+	}
+}
+
+func TestValidate_DuplicateProjectAcrossOrgs(t *testing.T) {
+	cfg := &Config{
+		Organizations: []AzureOrgConfig{
+			{Name: "org-a", Projects: []string{"shared"}},
+			{Name: "org-b", Projects: []string{"shared"}},
+		},
+		PollingInterval: 60,
+		Theme:           "dark",
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate() succeeded, want duplicate-project error")
+	}
+	if !strings.Contains(err.Error(), "shared") {
+		t.Errorf("error = %v, want to name the project", err)
+	}
+}
+
+func TestValidate_DuplicateOrgName(t *testing.T) {
+	cfg := &Config{
+		Organizations: []AzureOrgConfig{
+			{Name: "SameOrg", Projects: []string{"a"}},
+			{Name: "sameorg", Projects: []string{"b"}},
+		},
+		PollingInterval: 60,
+		Theme:           "dark",
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate() succeeded, want duplicate-org error")
+	}
+}
+
+func TestSave_Organizations_RoundTrip(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	content := `organizations:
+  - name: org-a
+    projects:
+      - proj-a
+  - name: org-b
+    projects:
+      - proj-b
+polling_interval: 60
+theme: dark
+`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	cfg, err := LoadFrom(configPath)
+	if err != nil {
+		t.Fatalf("LoadFrom: %v", err)
+	}
+	cfg.Theme = "nord"
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	body := string(raw)
+	if strings.Contains(body, "organization:") && !strings.Contains(body, "organizations:") {
+		t.Errorf("saved file looks legacy-shaped:\n%s", body)
+	}
+	if !strings.Contains(body, "organizations:") {
+		t.Errorf("saved file missing organizations:\n%s", body)
+	}
+	if strings.Contains(body, "\norganization:") || strings.HasPrefix(body, "organization:") {
+		t.Errorf("saved file still has legacy organization key:\n%s", body)
+	}
+	reloaded, err := LoadFrom(configPath)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if reloaded.Theme != "nord" {
+		t.Errorf("Theme = %q, want nord", reloaded.Theme)
+	}
+	if len(reloaded.Organizations) != 2 {
+		t.Fatalf("Organizations len = %d, want 2", len(reloaded.Organizations))
+	}
+}
+
+func TestSave_Legacy_RoundTripKeepsLegacyShape(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	content := `organization: only-org
+projects:
+  - only-proj
+polling_interval: 60
+theme: dark
+`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	cfg, err := LoadFrom(configPath)
+	if err != nil {
+		t.Fatalf("LoadFrom: %v", err)
+	}
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	raw, _ := os.ReadFile(configPath)
+	body := string(raw)
+	if strings.Contains(body, "organizations:") {
+		t.Errorf("legacy single-org save rewrote as organizations:\n%s", body)
+	}
+	if !strings.Contains(body, "organization:") {
+		t.Errorf("legacy save lost organization key:\n%s", body)
+	}
+}
+
+func TestNewWithPath_PopulatesOrganizations(t *testing.T) {
+	cfg := NewWithPath("wizard-org", []string{"wp"}, 60, "dark", "/tmp/x.yaml")
+	if len(cfg.Organizations) != 1 || cfg.Organizations[0].Name != "wizard-org" {
+		t.Fatalf("Organizations = %+v", cfg.Organizations)
+	}
+	if !cfg.HasAzure() {
+		t.Error("HasAzure() = false")
+	}
+}

@@ -18,6 +18,7 @@ import (
 	"github.com/Elpulgo/azdo/internal/provider"
 	"github.com/Elpulgo/azdo/internal/state"
 	"github.com/Elpulgo/azdo/internal/ui/components"
+	"github.com/Elpulgo/azdo/internal/ui/orgselect"
 	"github.com/Elpulgo/azdo/internal/ui/patinput"
 	"github.com/Elpulgo/azdo/internal/ui/providerselect"
 	"github.com/Elpulgo/azdo/internal/ui/setupwizard"
@@ -184,13 +185,39 @@ func runAuth() error {
 	}
 }
 
-// runAuthAzure is the Azure DevOps PAT auth flow — byte-for-byte identical to
-// the behaviour before the provider prompt was added.
+// runAuthAzure is the Azure DevOps PAT auth flow. When the config lists more
+// than one organisation, the user picks which organisation the PAT belongs
+// to and it is stored under pat:<org>; otherwise the legacy shared keyring
+// entry is used.
 func runAuthAzure(store *config.KeyringStore) error {
-	_, err := store.GetPAT()
-	isUpdate := err == nil
+	orgName, err := resolveAuthOrganization()
+	if err != nil {
+		return err
+	}
 
-	if isUpdate {
+	var isUpdate bool
+	if orgName != "" {
+		_, err = store.GetPATForOrg(orgName)
+		// Treat a hit on the per-org entry (not merely the shared fallback)
+		// as an update of that org's PAT. GetPATForOrg always falls through
+		// to the shared entry, so check the dedicated key via a round-trip
+		// store after a successful Set — for the prompt label, "update" when
+		// any token would resolve is fine and matches prior single-org UX.
+		isUpdate = err == nil
+	} else {
+		_, err = store.GetPAT()
+		isUpdate = err == nil
+	}
+
+	if orgName != "" {
+		if isUpdate {
+			fmt.Printf("Azure DevOps PAT Update (%s)\n", orgName)
+			fmt.Println("This will replace the Personal Access Token for this organisation in the system keyring.")
+		} else {
+			fmt.Printf("Azure DevOps PAT Setup (%s)\n", orgName)
+			fmt.Println("This will store a Personal Access Token for this organisation in the system keyring.")
+		}
+	} else if isUpdate {
 		fmt.Println("Azure DevOps PAT Update")
 		fmt.Println("This will replace your existing Personal Access Token in the system keyring.")
 	} else {
@@ -201,16 +228,65 @@ func runAuthAzure(store *config.KeyringStore) error {
 	fmt.Println(patinput.PermissionInfoPlain())
 	fmt.Println()
 
-	pat, err := promptForPATWithMode(store, isUpdate)
+	pat, err := promptForPATWithMode(store, isUpdate, orgName)
 	if err != nil {
 		return fmt.Errorf("failed to set PAT: %w", err)
 	}
 
 	if pat != "" {
-		fmt.Println("\nPAT saved successfully to system keyring.")
+		if orgName != "" {
+			fmt.Printf("\nPAT for %s saved successfully to system keyring.\n", orgName)
+		} else {
+			fmt.Println("\nPAT saved successfully to system keyring.")
+		}
 	}
 
 	return nil
+}
+
+// resolveAuthOrganization returns the organisation name to store a PAT under.
+// Multi-organisation configs prompt for a choice; single-organisation configs
+// return that organisation's name (stored under pat:<org> so it still works
+// when a second org is added later); no Azure config returns "" (legacy
+// shared keyring entry).
+func resolveAuthOrganization() (string, error) {
+	cfg, err := config.Load()
+	if err != nil {
+		if errors.Is(err, config.ErrConfigNotFound) {
+			return "", nil
+		}
+		return "", err
+	}
+	if !cfg.HasAzure() {
+		return "", nil
+	}
+	names := make([]string, 0, len(cfg.Organizations))
+	for _, org := range cfg.Organizations {
+		if org.Name != "" {
+			names = append(names, org.Name)
+		}
+	}
+	if len(names) == 0 {
+		return cfg.Organization, nil
+	}
+	if len(names) == 1 {
+		return names[0], nil
+	}
+
+	selModel := orgselect.NewModel(names)
+	selProg := tea.NewProgram(selModel)
+	selResult, err := selProg.Run()
+	if err != nil {
+		return "", fmt.Errorf("failed to run organisation selection: %w", err)
+	}
+	finalSel, ok := selResult.(orgselect.Model)
+	if !ok {
+		return "", fmt.Errorf("unexpected model type from organisation selection")
+	}
+	if finalSel.Cancelled() || !finalSel.Chosen() {
+		return "", fmt.Errorf("organisation selection cancelled")
+	}
+	return finalSel.Selected(), nil
 }
 
 // runAuthGitHub is the GitHub token auth flow.
@@ -290,49 +366,67 @@ func runTUI() error {
 
 	var backends []provider.Provider
 	var azureMC *azdevops.MultiClient
-	var azureNotifStore *azdevops.TriageStore
+	var azureNotifStores []*azdevops.TriageStore
 
-	// --- Azure backend (only when fully configured) ---
+	// --- Azure backends (one adapter per configured organisation) ---
+	// Each organisation becomes its own provider.Provider inside the
+	// CompositeProvider, reusing the existing multi-backend list fan-out and
+	// scope→backend detail routing. Metrics stays bound to the first
+	// organisation's MultiClient (documented follow-up to fan metrics out).
 	if cfg.HasAzure() {
-		pat, err := store.GetPAT()
-		if err != nil {
-			if errors.Is(err, config.ErrNotFound) {
-				pat, err = promptForPAT(store)
-				if err != nil {
-					return fmt.Errorf("failed to set PAT: %w", err)
-				}
-			} else {
-				return fmt.Errorf("failed to get PAT: %w", err)
-			}
-		}
-
-		client, err := azdevops.NewMultiClient(cfg.Organization, cfg.Projects, pat, cfg.DisplayNames)
-		if err != nil {
-			return fmt.Errorf("failed to create Azure DevOps client: %w", err)
-		}
-		azureMC = client
-
-		// NewAdapter alone (bare, no notifications store) still satisfies
-		// provider.NotificationSource by method set — Go's structural typing
-		// does not care that its notifStore field is left at its zero value.
-		// That would make the Notifications tab appear for an Azure-only
-		// config while List's nil-store guard makes every poll fail
-		// (azdevops.Adapter.list's own doc comment, task 8 review, 🔴
-		// finding 1). NewAdapterWithNotifications is what actually wires the
-		// local read/done triage store notifications need.
-		notifPath, err := azdevops.NotifStorePath()
-		if err != nil {
-			return fmt.Errorf("resolve notifications state path: %w", err)
-		}
-		notifStore, err := azdevops.NewTriageStore(notifPath)
-		if err != nil {
-			return fmt.Errorf("load notifications state: %w", err)
-		}
-		azureNotifStore = notifStore
-
+		multiOrg := cfg.IsMultiOrganization()
 		lookbackDays, sourceToggles, minPollInterval := azureNotificationArgs(cfg.Notifications.Azure)
-		backends = append(backends, azdevops.NewAdapterWithNotifications(
-			client, notifStore, lookbackDays, sourceToggles, minPollInterval))
+
+		for i, org := range cfg.Organizations {
+			if org.Name == "" || len(org.Projects) == 0 {
+				continue
+			}
+
+			pat, err := store.GetPATForOrg(org.Name)
+			if err != nil {
+				if errors.Is(err, config.ErrNotFound) {
+					pat, err = promptForPATForOrg(store, org.Name)
+					if err != nil {
+						return fmt.Errorf("failed to set PAT for organisation %q: %w", org.Name, err)
+					}
+				} else {
+					return fmt.Errorf("failed to get PAT for organisation %q: %w", org.Name, err)
+				}
+			}
+
+			client, err := azdevops.NewMultiClient(org.Name, org.Projects, pat, org.DisplayNames)
+			if err != nil {
+				return fmt.Errorf("failed to create Azure DevOps client for organisation %q: %w", org.Name, err)
+			}
+			if i == 0 || azureMC == nil {
+				azureMC = client
+			}
+
+			// NewAdapter alone (bare, no notifications store) still satisfies
+			// provider.NotificationSource by method set — Go's structural typing
+			// does not care that its notifStore field is left at its zero value.
+			// That would make the Notifications tab appear for an Azure-only
+			// config while List's nil-store guard makes every poll fail
+			// (azdevops.Adapter.list's own doc comment, task 8 review, 🔴
+			// finding 1). NewAdapterWithNotifications is what actually wires the
+			// local read/done triage store notifications need.
+			notifPath, err := azdevops.NotifStorePathFor(org.Name, multiOrg)
+			if err != nil {
+				return fmt.Errorf("resolve notifications state path for %q: %w", org.Name, err)
+			}
+			notifStore, err := azdevops.NewTriageStore(notifPath)
+			if err != nil {
+				return fmt.Errorf("load notifications state for %q: %w", org.Name, err)
+			}
+			azureNotifStores = append(azureNotifStores, notifStore)
+
+			adapter := azdevops.NewAdapterWithNotifications(
+				client, notifStore, lookbackDays, sourceToggles, minPollInterval)
+			if multiOrg {
+				adapter.SetQualifyScopeDisplay(true)
+			}
+			backends = append(backends, adapter)
+		}
 	}
 
 	// --- GitHub backend (only when at least one repo is configured) ---
@@ -417,8 +511,11 @@ func runTUI() error {
 		if flushErr := stateStore.Flush(); flushErr != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to persist state: %v\n", flushErr)
 		}
-		if azureNotifStore != nil {
-			if flushErr := azureNotifStore.Flush(); flushErr != nil {
+		for _, notifStore := range azureNotifStores {
+			if notifStore == nil {
+				continue
+			}
+			if flushErr := notifStore.Flush(); flushErr != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to persist notifications state: %v\n", flushErr)
 			}
 		}
@@ -496,14 +593,20 @@ func runSetupWizard() (*config.Config, error) {
 	return cfg, nil
 }
 
-// promptForPAT displays a TUI to prompt the user for their PAT (first-time setup)
-func promptForPAT(store *config.KeyringStore) (string, error) {
-	return promptForPATWithMode(store, false)
+// promptForPATForOrg displays a TUI to prompt for a PAT for one organisation
+// (first-time setup for that org).
+func promptForPATForOrg(store *config.KeyringStore, org string) (string, error) {
+	if org != "" {
+		fmt.Printf("Personal Access Token required for organisation %q\n\n", org)
+	}
+	return promptForPATWithMode(store, false, org)
 }
 
 // promptForPATWithMode displays a TUI to prompt the user for their PAT.
 // If isUpdate is true, shows an "update" message instead of "first-time setup".
-func promptForPATWithMode(store *config.KeyringStore, isUpdate bool) (string, error) {
+// When org is non-empty the token is stored under pat:<org>; otherwise under
+// the legacy shared keyring entry.
+func promptForPATWithMode(store *config.KeyringStore, isUpdate bool, org string) (string, error) {
 	var model patinput.Model
 	if isUpdate {
 		model = patinput.NewModelForUpdate()
@@ -528,8 +631,11 @@ func promptForPATWithMode(store *config.KeyringStore, isUpdate bool) (string, er
 		return "", fmt.Errorf("PAT input cancelled or empty")
 	}
 
-	// Save PAT to keyring
-	if err := store.SetPAT(pat); err != nil {
+	if org != "" {
+		if err := store.SetPATForOrg(org, pat); err != nil {
+			return "", fmt.Errorf("failed to save PAT to keyring: %w", err)
+		}
+	} else if err := store.SetPAT(pat); err != nil {
 		return "", fmt.Errorf("failed to save PAT to keyring: %w", err)
 	}
 

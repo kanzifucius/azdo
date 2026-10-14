@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -245,6 +246,7 @@ func (a *Adapter) list(opts provider.NotifOpts, now time.Time) ([]provider.Notif
 		state := a.notifStore.State()
 		reconciled, _ := Reconcile(a.notifLastRawRows, state, now)
 		sortNotificationsDeterministically(reconciled)
+		a.qualifyNotificationDisplays(reconciled)
 		return reconciled, nil
 	}
 
@@ -270,9 +272,34 @@ func (a *Adapter) list(opts provider.NotifOpts, now time.Time) ([]provider.Notif
 		// and never gets cached — see notifThrottled's doc comment.
 		a.notifLastPollAt = now
 		a.notifLastRawRows = rows
+		a.qualifyNotificationDisplays(reconciled)
 		return reconciled, nil
 	}
 	return nil, fmt.Errorf("azdevops: notifications: all %d sources failed: %w", len(errs), errors.Join(errs...))
+}
+
+// qualifyNotificationDisplays prefixes each Azure notification's ScopeDisplay
+// with the organisation name when qualifyScopeDisplay is set. Scope (the
+// routing key) is left untouched.
+func (a *Adapter) qualifyNotificationDisplays(rows []provider.Notification) {
+	if a == nil || !a.qualifyScopeDisplay || a.mc == nil {
+		return
+	}
+	org := a.mc.GetOrg()
+	if org == "" {
+		return
+	}
+	prefix := org + "/"
+	for i := range rows {
+		d := rows[i].Identity.ScopeDisplay
+		if d == "" {
+			d = rows[i].Identity.Scope
+		}
+		if strings.HasPrefix(d, prefix) {
+			continue
+		}
+		rows[i].Identity.ScopeDisplay = prefix + d
+	}
 }
 
 // notifThrottled reports whether now falls inside the self-throttle window

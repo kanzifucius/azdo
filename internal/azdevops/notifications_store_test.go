@@ -81,6 +81,43 @@ func TestNotifStorePath_DiffersFromStatePathInSameDir(t *testing.T) {
 	}
 }
 
+func TestNotifStorePathFor_SingleOrgKeepsLegacyPath(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", tmp)
+
+	legacy, err := NotifStorePath()
+	if err != nil {
+		t.Fatalf("NotifStorePath: %v", err)
+	}
+	got, err := NotifStorePathFor("my-org", false)
+	if err != nil {
+		t.Fatalf("NotifStorePathFor: %v", err)
+	}
+	if got != legacy {
+		t.Errorf("single-org path = %q, want legacy %q", got, legacy)
+	}
+}
+
+func TestNotifStorePathFor_MultiOrgIsPerOrg(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", tmp)
+
+	got, err := NotifStorePathFor("My-Org", true)
+	if err != nil {
+		t.Fatalf("NotifStorePathFor: %v", err)
+	}
+	if filepath.Base(got) != "notifications-my_org.yaml" {
+		t.Errorf("base = %q, want notifications-my_org.yaml", filepath.Base(got))
+	}
+	other, err := NotifStorePathFor("other", true)
+	if err != nil {
+		t.Fatalf("other: %v", err)
+	}
+	if got == other {
+		t.Error("two orgs must not share a triage-store path")
+	}
+}
+
 func TestNewTriageStore_MissingFileStartsEmpty(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "notifications.yaml")
 	store, err := NewTriageStore(path)

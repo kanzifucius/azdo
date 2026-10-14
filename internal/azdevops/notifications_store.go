@@ -4,8 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/Elpulgo/azdo/internal/state"
 	"gopkg.in/yaml.v3"
@@ -71,6 +73,37 @@ func (s TriageState) clone() TriageState {
 // the two files always sit side by side.
 func NotifStorePath() (string, error) {
 	return state.PathFor(notifFileName)
+}
+
+// NotifStorePathFor returns the triage-store path for one Azure organisation.
+// When multiOrg is false (single-organisation or legacy configs), it returns
+// the same path as NotifStorePath so existing read/done state is preserved.
+// When multiOrg is true, each organisation gets its own file
+// (notifications-<org>.yaml) so concurrent adapters cannot clobber each
+// other's debounced writes.
+func NotifStorePathFor(org string, multiOrg bool) (string, error) {
+	if !multiOrg || strings.TrimSpace(org) == "" {
+		return NotifStorePath()
+	}
+	return state.PathFor("notifications-" + sanitizeOrgFileComponent(org) + ".yaml")
+}
+
+// sanitizeOrgFileComponent turns an organisation name into a safe filename
+// fragment: letters and digits kept, everything else becomes '_', lower-cased.
+func sanitizeOrgFileComponent(org string) string {
+	var b strings.Builder
+	for _, r := range strings.TrimSpace(org) {
+		switch {
+		case unicode.IsLetter(r) || unicode.IsDigit(r):
+			b.WriteRune(unicode.ToLower(r))
+		default:
+			b.WriteRune('_')
+		}
+	}
+	if b.Len() == 0 {
+		return "org"
+	}
+	return b.String()
 }
 
 // LoadTriageState reads and parses notifications.yaml. A missing file is
