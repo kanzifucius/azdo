@@ -187,3 +187,61 @@ func TestGetPAT_ErrorWhenNoFallback(t *testing.T) {
 		t.Errorf("Error message should mention AZDO_PAT env var: %s", errMsg)
 	}
 }
+
+func TestSetPATForOrg_AndGet(t *testing.T) {
+	mock := newMockKeyring()
+	ks := &KeyringStore{provider: mock}
+
+	if err := ks.SetPATForOrg("Org-A", "token-a"); err != nil {
+		t.Fatalf("SetPATForOrg: %v", err)
+	}
+	stored, err := mock.Get(serviceName, "pat:Org-A")
+	if err != nil || stored != "token-a" {
+		t.Fatalf("stored = %q, err = %v", stored, err)
+	}
+
+	got, err := ks.GetPATForOrg("Org-A")
+	if err != nil || got != "token-a" {
+		t.Fatalf("GetPATForOrg = %q, %v", got, err)
+	}
+}
+
+func TestGetPATForOrg_FallsBackToLegacyThenEnv(t *testing.T) {
+	t.Setenv("AZDO_PAT", "")
+	t.Setenv("AZDO_PAT_ORG_B", "")
+
+	mock := newMockKeyring()
+	ks := &KeyringStore{provider: mock}
+
+	// Shared legacy PAT applies to every org.
+	if err := ks.SetPAT("shared"); err != nil {
+		t.Fatalf("SetPAT: %v", err)
+	}
+	got, err := ks.GetPATForOrg("org-b")
+	if err != nil || got != "shared" {
+		t.Fatalf("legacy fallback = %q, %v; want shared", got, err)
+	}
+
+	// Per-org env beats missing keyring entries when legacy is deleted.
+	if err := ks.DeletePAT(); err != nil {
+		t.Fatalf("DeletePAT: %v", err)
+	}
+	t.Setenv("AZDO_PAT_ORG_B", "from-env-org")
+	got, err = ks.GetPATForOrg("org-b")
+	if err != nil || got != "from-env-org" {
+		t.Fatalf("org env fallback = %q, %v", got, err)
+	}
+
+	t.Setenv("AZDO_PAT_ORG_B", "")
+	t.Setenv("AZDO_PAT", "from-env")
+	got, err = ks.GetPATForOrg("org-b")
+	if err != nil || got != "from-env" {
+		t.Fatalf("AZDO_PAT fallback = %q, %v", got, err)
+	}
+}
+
+func TestOrgPATEnvName(t *testing.T) {
+	if got := orgPATEnvName("my-org"); got != "AZDO_PAT_MY_ORG" {
+		t.Errorf("orgPATEnvName(my-org) = %q", got)
+	}
+}

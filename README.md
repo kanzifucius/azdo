@@ -85,9 +85,9 @@ go install github.com/Elpulgo/azdo/cmd/azdo-tui@latest
 ## Features
 
 ### Backends
-- **Azure DevOps** — projects via WIQL queries and the REST v7.1 API
+- **Azure DevOps** — one or more organisations, each with its own projects, via WIQL queries and the REST v7.1 API
 - **GitHub** — repositories via REST + GraphQL; issues map to work items, labels map to item type / priority / tags, pull-request reviews map to votes, and GitHub Actions runs map to pipelines
-- **Mix freely** — configure Azure projects, GitHub repos, or both. Every list view fans out across all configured backends; the per-row origin glyph (⬢ / ⎇) appears only when a list actually mixes backends
+- **Mix freely** — configure Azure organisations/projects, GitHub repos, or both. Every list view fans out across all configured backends (and across every Azure organisation); the per-row origin glyph (⬢ / ⎇) appears only when a list actually mixes backends
 - See [Configuration](#configuration) for how to set up each backend
 
 ### Multi-Tab Interface
@@ -200,7 +200,7 @@ On the next launch the tab walks every in-flight or recently-closed work item ac
 - Graceful error handling with automatic retry
 - Eight built-in themes with true color support
 - **Theme switcher** modal (press `t`) to change themes on the fly
-- **Multi-project and multi-repo support** across Azure DevOps and GitHub, with display name customization
+- **Multi-organisation, multi-project and multi-repo support** across Azure DevOps and GitHub, with display name customisation
 - **State persistence** — remembers the last active tab and the last opened PR / work item detail across sessions, so you can pick up where you left off
 
 ## Demo Mode
@@ -251,10 +251,22 @@ Configure at least one backend — Azure DevOps, GitHub, or both.
 
 ```yaml
 # ── Azure DevOps (optional; required only if you use Azure) ──────────────
-# Organization name. Required when any Azure projects are listed.
+# Multiple organisations (recommended when you work across more than one):
+# organizations:
+#   - name: org-a
+#     projects:
+#       - project-one
+#       - name: ugly-api-project-name
+#         display_name: My Project
+#   - name: org-b
+#     projects:
+#       - project-two
+# Project API names must be unique across organisations.
+#
+# Legacy single-organisation form (still fully supported):
 organization: your-org-name
 
-# Azure DevOps project name(s).
+# Azure DevOps project name(s) for the legacy form.
 # Simple format:
 projects:
   - your-project-name
@@ -346,12 +358,13 @@ theme: dark
 ```
 
 **Configuration Options:**
-- `organization`: Your Azure DevOps organization name. Required when `projects` is set.
-- `projects`: List of Azure DevOps project names. Each entry can be a plain string or an object with `name` and `display_name` fields. The `display_name` is shown in the TUI while the `name` is used for API calls.
+- `organizations`: List of Azure DevOps organisations. Each entry has `name` and `projects` (same project entry shapes as below). Prefer this when you use more than one organisation. Project API names must be unique across organisations.
+- `organization` / `projects`: Legacy single-organisation form. Still fully supported; equivalent to a one-entry `organizations` list. Do not set both shapes in the same file.
+- `projects` entries: each can be a plain string or an object with `name` and `display_name` fields. The `display_name` is shown in the TUI while the `name` is used for API calls.
 - `github.repos`: List of GitHub `owner/repo` slugs. Listing at least one enables the GitHub backend.
 - `github.type_prefix`: Label prefix used to derive a work item's type from GitHub issue labels (optional, default: `type:`). A label like `type:bug` maps to Bug; recognised values are bug, task, story / user story, feature, epic, issue. An unrecognised value (e.g. `type:chore`) is kept as a tag instead.
 - `github.priority_prefix`: Label prefix used to derive priority from GitHub issue labels (optional, default: `priority:`). Accepts `p1`–`p4` or bare `1`–`4`; anything else is kept as a tag.
-- **At least one backend is required** — set Azure (`organization` + `projects`), GitHub (`github.repos`), or both.
+- **At least one backend is required** — set Azure (`organizations`, or legacy `organization` + `projects`), GitHub (`github.repos`), or both.
 - `polling_interval`: How often to refresh data in seconds (optional, default: 60)
 - `theme`: Color theme for the UI (optional, default: dark)
 - `disabled_panes`: Comma-separated list of panes to hide (optional). Valid values: `pullrequests`, `pipelines`, `workitems`, `notifications`. When a pane is disabled, its tab, keyboard shortcuts, and all related UI are removed, and remaining tabs are renumbered. At least one pane must remain enabled — a config with only `notifications` enabled is valid as long as at least one notification-capable backend (Azure DevOps or GitHub) is configured. Adding or removing `notifications` here only takes effect on the **next restart**; the tab list is computed once at startup.
@@ -664,7 +677,9 @@ Run `azdo auth` and pick the backend you want to set credentials for (Azure DevO
 - **macOS**: Keychain
 - **Linux**: Secret Service (gnome-keyring, KWallet, etc.)
 
-If your system doesn't support a keyring, you can fall back to environment variables: `AZDO_PAT` for Azure DevOps and `GITHUB_TOKEN` for GitHub. To update credentials at any time, run `azdo auth`.
+If your system doesn't support a keyring, you can fall back to environment variables: `AZDO_PAT` (and optionally `AZDO_PAT_<ORG>` per organisation) for Azure DevOps, and `GITHUB_TOKEN` for GitHub. To update credentials at any time, run `azdo auth` — multi-organisation configs prompt you to pick which organisation the PAT belongs to.
+
+Per-organisation Azure PAT resolution order: keyring `pat:<org>` → legacy shared keyring `pat` → `AZDO_PAT_<ORG>` → `AZDO_PAT`.
 
 #### Azure DevOps — Personal Access Token (PAT)
 

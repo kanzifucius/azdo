@@ -87,3 +87,4 @@ func TestAdapterScopes(t *testing.T) {
 		})
 	}
 }
+

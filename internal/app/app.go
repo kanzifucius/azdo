@@ -541,7 +541,7 @@ func NewModel(p provider.Provider, mc *azdevops.MultiClient, cfg *config.Config,
 
 	// Create status bar with org/project info
 	statusBar := components.NewStatusBar(appStyles)
-	statusBar.SetOrganization(cfg.Organization)
+	statusBar.SetOrganization(cfg.OrganizationLabel())
 	statusBar.SetScopes(displayScopes(p, cfg))
 
 	// Gate metrics on both the config flag and a live Azure backend.
@@ -985,7 +985,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if previousWarning != "" {
 			m.statusBar.SetWarningMessage(previousWarning)
 		}
-		m.statusBar.SetOrganization(m.config.Organization)
+		m.statusBar.SetOrganization(m.config.OrganizationLabel())
 		m.statusBar.SetScopes(displayScopes(m.client, m.config))
 		m.statusBar.SetWidth(m.width)
 

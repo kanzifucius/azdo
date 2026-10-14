@@ -107,7 +107,7 @@ func FilterNotifications(rows []provider.Notification, cfg *config.Config) []pro
 			if row.Identity.Kind == provider.KindAzure {
 				narrowed = narrowAzure
 			}
-			if !narrowed || matchesAnyScope(includeRepos, scopeCandidates(row, cfg.Organization)) {
+			if !narrowed || matchesAnyScope(includeRepos, scopeCandidates(row, cfg)) {
 				out = append(out, row)
 			}
 		}
@@ -123,7 +123,7 @@ func FilterNotifications(rows []provider.Notification, cfg *config.Config) []pro
 		// empties a feed. It gets the same org-qualified candidates so that
 		// one spelling ("myorg/project1") means the same thing in both keys.
 		out = dropWhere(out, func(row provider.Notification) bool {
-			return matchesAnyScope(nc.ExcludeRepos, scopeCandidates(row, cfg.Organization))
+			return matchesAnyScope(nc.ExcludeRepos, scopeCandidates(row, cfg))
 		})
 	}
 
@@ -234,10 +234,19 @@ func matchesAnyGlob(patterns []string, scope string) bool {
 // "elpulgo/*" selects GitHub repos, while a bare project name keeps working
 // for configs written before this existed.
 //
-// org is the config's `organization`. An empty org yields the bare scope
-// alone, never a "/project" candidate that a pattern could match by accident.
-func scopeCandidates(row provider.Notification, org string) []string {
-	if row.Identity.Kind != provider.KindAzure || strings.TrimSpace(org) == "" {
+// The owning organisation is resolved via cfg.OrgForProject so multi-
+// organisation configs produce the correct "<org>/<project>" spelling for
+// each row. An empty/unknown org yields the bare scope alone, never a
+// "/project" candidate that a pattern could match by accident.
+func scopeCandidates(row provider.Notification, cfg *config.Config) []string {
+	if row.Identity.Kind != provider.KindAzure || cfg == nil {
+		return []string{row.Identity.Scope}
+	}
+	org := cfg.OrgForProject(row.Identity.Scope)
+	if org == "" {
+		org = cfg.Organization
+	}
+	if strings.TrimSpace(org) == "" {
 		return []string{row.Identity.Scope}
 	}
 	return []string{row.Identity.Scope, strings.TrimSpace(org) + "/" + row.Identity.Scope}
@@ -286,7 +295,7 @@ func matchesAnyScope(patterns, scopes []string) bool {
 // extra row is a far cheaper mistake than a silently missing one.
 func includeSelection(patterns []string, cfg *config.Config) (narrowAzure, narrowOther bool) {
 	for _, p := range patterns {
-		if globAddressesAzure(p, cfg.Organization, cfg.Projects) {
+		if globAddressesAzureConfig(p, cfg) {
 			narrowAzure = true
 			continue
 		}
@@ -295,13 +304,31 @@ func includeSelection(patterns []string, cfg *config.Config) (narrowAzure, narro
 	return narrowAzure, narrowOther
 }
 
-// globAddressesAzure reports whether pattern matches at least one configured
-// Azure project, in either the bare or the "<org>/<project>" spelling.
+// globAddressesAzureConfig reports whether pattern matches at least one
+// configured Azure project across every organisation, in either the bare or
+// the "<org>/<project>" spelling.
+func globAddressesAzureConfig(pattern string, cfg *config.Config) bool {
+	if cfg == nil {
+		return false
+	}
+	if len(cfg.Organizations) > 0 {
+		for _, org := range cfg.Organizations {
+			if globAddressesAzure(pattern, org.Name, org.Projects) {
+				return true
+			}
+		}
+		return false
+	}
+	return globAddressesAzure(pattern, cfg.Organization, cfg.Projects)
+}
+
+// globAddressesAzure reports whether pattern matches at least one of the
+// given projects, in either the bare or the "<org>/<project>" spelling.
 //
-// It tests cfg.Projects -- the API project names -- and not DisplayNames,
-// because Identity.Scope is set from the API name too. Matching the display
-// name here would classify a pattern as Azure-addressing that no row could
-// ever match, narrowing Azure to nothing.
+// It tests API project names -- and not DisplayNames -- because
+// Identity.Scope is set from the API name too. Matching the display name
+// here would classify a pattern as Azure-addressing that no row could ever
+// match, narrowing Azure to nothing.
 func globAddressesAzure(pattern, org string, projects []string) bool {
 	for _, p := range projects {
 		project := strings.TrimSpace(p)

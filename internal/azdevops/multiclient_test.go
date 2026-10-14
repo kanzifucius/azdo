@@ -847,3 +847,21 @@ func TestMultiClient_ListRecentlyAssignedWorkItems_PartialFailure(t *testing.T) 
 		t.Errorf("expected Failed=1, got %d", partialErr.Failed)
 	}
 }
+
+func TestAdapter_ScopeDisplayFor_Qualify(t *testing.T) {
+	mc, err := NewMultiClient("org-a", []string{"proj"}, "pat", nil)
+	if err != nil {
+		t.Fatalf("NewMultiClient: %v", err)
+	}
+	a := NewAdapter(mc)
+	if got := a.scopeDisplayFor("proj", "Pretty"); got != "Pretty" {
+		t.Errorf("unqualified = %q, want Pretty", got)
+	}
+	a.SetQualifyScopeDisplay(true)
+	if got := a.scopeDisplayFor("proj", "Pretty"); got != "org-a/Pretty" {
+		t.Errorf("qualified = %q, want org-a/Pretty", got)
+	}
+	if got := a.scopeDisplayFor("proj", ""); got != "org-a/proj" {
+		t.Errorf("qualified empty display = %q, want org-a/proj", got)
+	}
+}

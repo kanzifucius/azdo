@@ -38,6 +38,19 @@ export AZDO_PAT="your-pat-here"
 azdo
 ```
 
+For a multi-organisation config you can also set a per-organisation variable `AZDO_PAT_<ORG>` (organisation name upper-cased, non-alphanumeric characters become `_`). Resolution order per organisation is: keyring `pat:<org>` → legacy shared keyring `pat` → `AZDO_PAT_<ORG>` → `AZDO_PAT`.
+
+## Can I configure more than one Azure DevOps organisation?
+
+Yes. Use the `organizations:` list in `config.yaml` (see `config.yaml.example`). Pull requests, work items, pipelines and notifications merge across every configured organisation the same way they already merge across Azure and GitHub. Detail actions route back to the organisation that owns the row's project.
+
+Two constraints to know about:
+
+1. **Project API names must be unique across organisations.** Detail routing keys on the bare project name, so the same project name under two organisations is rejected at config load with a clear error. Rename one entry or split the configs if you hit this.
+2. **PATs can be per organisation.** Run `azdo auth`, pick Azure DevOps, then pick the organisation. Tokens are stored under `pat:<org>` in the keyring; a single shared PAT (legacy `pat` entry or `AZDO_PAT`) still applies to every organisation as a fallback.
+
+The Metrics tab currently uses the first configured organisation only.
+
 ## How do I create a custom theme?
 
 1. Create a JSON file in the themes directory:
@@ -75,7 +88,7 @@ The app persists a small amount of navigation state (last active tab, last opene
 
 It is created lazily on first save — a missing file is normal and not an error. Delete it to reset to the default view (Pull Requests tab, no detail open). Pipeline detail is intentionally not persisted.
 
-There is a **second** state file in the same directory, `notifications.yaml`, holding the read and dismissed markers for the Azure share of the Notifications feed (Azure DevOps has no server-side inbox, so that state has nowhere else to live — GitHub's read state stays on GitHub). Deleting `state.yaml` does not touch it. Delete `notifications.yaml` to clear your Azure triage history: every Azure row comes back unread, which on a busy org means a large feed on the next poll. Like `state.yaml`, a missing file loads as empty rather than erroring, and it is local to the machine — see [Local Triage State](README.md#local-triage-state-azure-devops) in the README.
+There is a **second** state file in the same directory, `notifications.yaml`, holding the read and dismissed markers for the Azure share of the Notifications feed (Azure DevOps has no server-side inbox, so that state has nowhere else to live — GitHub's read state stays on GitHub). Multi-organisation configs use one file per organisation (`notifications-<org>.yaml`) instead, so each organisation's triage state stays independent. Deleting `state.yaml` does not touch these files. Delete `notifications.yaml` (or the per-org files) to clear your Azure triage history: every Azure row comes back unread, which on a busy org means a large feed on the next poll. Like `state.yaml`, a missing file loads as empty rather than erroring, and it is local to the machine — see [Local Triage State](README.md#local-triage-state-azure-devops) in the README.
 
 ## I don't see a Notifications tab
 

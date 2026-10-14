@@ -10,6 +10,7 @@ import (
 
 	"github.com/Elpulgo/azdo/internal/provider"
 	"github.com/spf13/viper"
+	"gopkg.in/yaml.v3"
 )
 
 // ErrConfigNotFound is returned when the config file does not exist.
@@ -26,12 +27,33 @@ type GitHubConfig struct {
 	PriorityPrefix string   `mapstructure:"priority_prefix"` // label prefix for priority; empty → use DefaultLabelConvention
 }
 
+// AzureOrgConfig holds one Azure DevOps organisation and the projects that
+// belong to it. Multi-organisation configs list several of these under
+// organizations:; a single-organisation config may still use the legacy
+// top-level organization:/projects: keys, which LoadFrom migrates into a
+// one-entry Organizations slice.
+type AzureOrgConfig struct {
+	Name         string            `mapstructure:"name"`
+	Projects     []string          `mapstructure:"projects"`
+	DisplayNames map[string]string `mapstructure:"-"` // API name → display name
+}
+
 // Config holds the application configuration
 type Config struct {
-	Organization    string              `mapstructure:"organization"`
-	Project         string              `mapstructure:"project"` // deprecated: use Projects
-	Projects        []string            `mapstructure:"projects"`
-	DisplayNames    map[string]string   `mapstructure:"-"`     // API name → display name
+	// Organization, Project, Projects and DisplayNames are the legacy
+	// single-organisation Azure fields. Prefer Organizations for new code.
+	// LoadFrom always back-populates these from Organizations[0] (when
+	// present) so existing callers and test fixtures keep working.
+	Organization string            `mapstructure:"organization"`
+	Project      string            `mapstructure:"project"`  // deprecated: use Projects / Organizations
+	Projects     []string          `mapstructure:"projects"` // deprecated: use Organizations
+	DisplayNames map[string]string `mapstructure:"-"`       // API name → display name (first org)
+
+	// Organizations is the canonical list of Azure DevOps organisations.
+	// Empty when Azure is not configured. After LoadFrom this is the
+	// single source of truth; the legacy fields above mirror the first entry.
+	Organizations []AzureOrgConfig `mapstructure:"organizations"`
+
 	Terms           map[string]string   `mapstructure:"terms"` // tab/term key → user-facing label
 	PollingInterval int                 `mapstructure:"polling_interval"`
 	Theme           string              `mapstructure:"theme"`
@@ -49,14 +71,25 @@ type Config struct {
 	// (mapstructure:"-"), and never printed by this package: a TUI has no
 	// safe place to write a line before or after Bubble Tea's alt-screen
 	// switch, so the notifications pane renders these instead.
-	Warnings   []string `mapstructure:"-"`
-	configPath string   // internal field to store config path for saving
+	Warnings []string `mapstructure:"-"`
+	// azureYAMLShape records which YAML shape LoadFrom saw for Azure so
+	// Save can round-trip a single-organisation legacy file without
+	// rewriting it as organizations:. "legacy", "organizations", or "".
+	azureYAMLShape string
+	configPath     string // internal field to store config path for saving
 }
 
-// HasAzure reports whether Azure DevOps is fully configured (org AND projects
-// are both present). Used by Validate and main.go to decide whether to build
-// an Azure backend.
+// HasAzure reports whether Azure DevOps is fully configured (at least one
+// organisation with a non-empty name and at least one project). Used by
+// Validate and main.go to decide whether to build Azure backends.
 func (c *Config) HasAzure() bool {
+	for _, org := range c.Organizations {
+		if org.Name != "" && len(org.Projects) > 0 {
+			return true
+		}
+	}
+	// Fallback for callers that only populate the legacy fields (setup
+	// wizard, older tests) without going through LoadFrom's normalisation.
 	return c.Organization != "" && len(c.Projects) > 0
 }
 
@@ -436,20 +469,132 @@ func (c *Config) IsPaneEnabled(pane string) bool {
 	return true
 }
 
-// IsMultiProject returns true when more than one project is configured.
+// IsMultiProject returns true when more than one project is configured across
+// every Azure organisation (or, for legacy-only callers, across Projects).
 func (c *Config) IsMultiProject() bool {
-	return len(c.Projects) > 1
+	return len(c.AllProjects()) > 1
+}
+
+// IsMultiOrganization returns true when more than one Azure organisation is
+// configured.
+func (c *Config) IsMultiOrganization() bool {
+	return len(c.Organizations) > 1
+}
+
+// AllProjects returns every configured Azure project API name across all
+// organisations, in organisation order then project order. Falls back to the
+// legacy Projects field when Organizations is empty.
+func (c *Config) AllProjects() []string {
+	if len(c.Organizations) == 0 {
+		return append([]string(nil), c.Projects...)
+	}
+	var out []string
+	for _, org := range c.Organizations {
+		out = append(out, org.Projects...)
+	}
+	return out
+}
+
+// OrganizationLabel returns a short status-bar label for the configured Azure
+// organisations: a single name, a comma-joined list, or "" when Azure is not
+// configured.
+func (c *Config) OrganizationLabel() string {
+	if len(c.Organizations) == 0 {
+		return c.Organization
+	}
+	names := make([]string, 0, len(c.Organizations))
+	for _, org := range c.Organizations {
+		if org.Name != "" {
+			names = append(names, org.Name)
+		}
+	}
+	return strings.Join(names, ", ")
+}
+
+// OrgForProject returns the organisation name that owns the given project API
+// name, or "" when no organisation claims it. When two organisations somehow
+// share a project name (rejected by Validate for multi-org configs), the
+// first match wins.
+func (c *Config) OrgForProject(project string) string {
+	for _, org := range c.Organizations {
+		for _, p := range org.Projects {
+			if p == project {
+				return org.Name
+			}
+		}
+	}
+	if len(c.Organizations) == 0 && c.Organization != "" {
+		for _, p := range c.Projects {
+			if p == project {
+				return c.Organization
+			}
+		}
+	}
+	return ""
 }
 
 // DisplayNameFor returns the display name for a project API name.
-// If no display name is configured, returns the API name itself.
+// Searches every organisation's DisplayNames map, then the legacy
+// DisplayNames field. If no display name is configured, returns the API name.
 func (c *Config) DisplayNameFor(apiName string) string {
+	for _, org := range c.Organizations {
+		if org.DisplayNames != nil {
+			if dn, ok := org.DisplayNames[apiName]; ok {
+				return dn
+			}
+		}
+	}
 	if c.DisplayNames != nil {
 		if dn, ok := c.DisplayNames[apiName]; ok {
 			return dn
 		}
 	}
 	return apiName
+}
+
+// syncLegacyAzureFields copies Organizations[0] into the deprecated
+// Organization/Projects/DisplayNames fields so callers that have not yet
+// migrated keep seeing a consistent view. No-op when Organizations is empty.
+func (c *Config) syncLegacyAzureFields() {
+	if len(c.Organizations) == 0 {
+		return
+	}
+	first := c.Organizations[0]
+	c.Organization = first.Name
+	c.Projects = append([]string(nil), first.Projects...)
+	if first.DisplayNames != nil {
+		c.DisplayNames = make(map[string]string, len(first.DisplayNames))
+		for k, v := range first.DisplayNames {
+			c.DisplayNames[k] = v
+		}
+	} else {
+		c.DisplayNames = nil
+	}
+}
+
+// ensureOrganizationsFromLegacy builds a one-entry Organizations slice from
+// the legacy Organization/Projects/DisplayNames fields when Organizations is
+// empty but the legacy fields describe a configured Azure backend. Used by
+// Validate and by callers (setup wizard, NewWithPath) that still populate
+// only the legacy fields.
+func (c *Config) ensureOrganizationsFromLegacy() {
+	if len(c.Organizations) > 0 {
+		return
+	}
+	if c.Organization == "" || len(c.Projects) == 0 {
+		return
+	}
+	org := AzureOrgConfig{
+		Name:     c.Organization,
+		Projects: append([]string(nil), c.Projects...),
+	}
+	if c.DisplayNames != nil {
+		org.DisplayNames = make(map[string]string, len(c.DisplayNames))
+		for k, v := range c.DisplayNames {
+			org.DisplayNames[k] = v
+		}
+	}
+	c.Organizations = []AzureOrgConfig{org}
 }
 
 // TermFor returns the configured label for a term key, or the fallback
@@ -504,6 +649,54 @@ func parseProjects(raw []interface{}) ([]string, map[string]string) {
 		displayNames = nil
 	}
 	return projects, displayNames
+}
+
+// asStringKeyedMap normalises a YAML map (Viper may produce
+// map[interface{}]interface{} or map[string]interface{}) into
+// map[string]interface{}.
+func asStringKeyedMap(item interface{}) (map[string]interface{}, bool) {
+	switch v := item.(type) {
+	case map[string]interface{}:
+		return v, true
+	case map[interface{}]interface{}:
+		out := make(map[string]interface{}, len(v))
+		for k, val := range v {
+			ks, ok := k.(string)
+			if !ok {
+				continue
+			}
+			out[ks] = val
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+// parseOrganizations parses the raw "organizations" YAML list. Each entry is
+// an object with name and projects (projects accepts the same string/object
+// mix as the top-level projects key). Entries without a name are skipped.
+func parseOrganizations(raw []interface{}) []AzureOrgConfig {
+	orgs := make([]AzureOrgConfig, 0, len(raw))
+	for _, item := range raw {
+		m, ok := asStringKeyedMap(item)
+		if !ok {
+			continue
+		}
+		name, _ := m["name"].(string)
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		org := AzureOrgConfig{Name: name}
+		if rawProjects, ok := m["projects"]; ok {
+			if slice, ok := rawProjects.([]interface{}); ok {
+				org.Projects, org.DisplayNames = parseProjects(slice)
+			}
+		}
+		orgs = append(orgs, org)
+	}
+	return orgs
 }
 
 // Default configuration values
@@ -763,6 +956,20 @@ func LoadFrom(configPath string) (*Config, error) {
 		v.Set("projects", []string{})
 	}
 
+	// Parse organizations the same way — each entry's projects list may
+	// contain objects, which mapstructure cannot unmarshal into []string.
+	// Always take ownership of Organizations from the raw value and clear
+	// the key before Unmarshal so a partial/wrong decode cannot stick.
+	var parsedOrganizations []AzureOrgConfig
+	hasOrganizationsKey := false
+	if rawOrgs := v.Get("organizations"); rawOrgs != nil {
+		hasOrganizationsKey = true
+		if rawSlice, ok := rawOrgs.([]interface{}); ok {
+			parsedOrganizations = parseOrganizations(rawSlice)
+		}
+		v.Set("organizations", []AzureOrgConfig{})
+	}
+
 	// Unmarshal config into struct
 	var cfg Config
 	if err := v.Unmarshal(&cfg); err != nil {
@@ -783,6 +990,29 @@ func LoadFrom(configPath string) (*Config, error) {
 		cfg.Projects = []string{cfg.Project}
 	}
 	cfg.Project = "" // clear deprecated field
+
+	// Resolve Azure organisation shape. Both organizations: and the legacy
+	// organization:/projects: keys set at once is a user error — the intent
+	// is ambiguous, so refuse rather than silently preferring one.
+	legacyAzurePresent := cfg.Organization != "" || len(cfg.Projects) > 0
+	if hasOrganizationsKey && legacyAzurePresent {
+		return nil, fmt.Errorf(
+			"config.yaml sets both 'organizations' and the legacy 'organization'/'projects' keys — use one form or the other\n\n"+
+				"Prefer the multi-organisation form:\n\n"+
+				"  organizations:\n"+
+				"    - name: your-org-name\n"+
+				"      projects:\n"+
+				"        - your-project-name\n\n"+
+				"For more details, visit: %s", configurationGuideURL)
+	}
+	if hasOrganizationsKey {
+		cfg.Organizations = parsedOrganizations
+		cfg.azureYAMLShape = "organizations"
+		cfg.syncLegacyAzureFields()
+	} else if legacyAzurePresent {
+		cfg.azureYAMLShape = "legacy"
+		cfg.ensureOrganizationsFromLegacy()
+	}
 
 	// Parse disabled_panes (comma-separated string)
 	if raw := v.GetString("disabled_panes"); raw != "" {
@@ -832,7 +1062,7 @@ func LoadFrom(configPath string) (*Config, error) {
 			"notifications.github.only_configured_repos is true — notifications.include_repos is ignored")
 	}
 
-	// An include_repos pattern whose first segment names the Azure organization
+	// An include_repos pattern whose first segment names an Azure organisation
 	// but which matches no configured project is almost certainly a typo, and
 	// it is the one mistake the filter cannot notice for itself: the per-backend
 	// rule classifies a pattern as Azure-addressing only when it matches a
@@ -840,13 +1070,15 @@ func LoadFrom(configPath string) (*Config, error) {
 	// instead and quietly narrows the wrong half of the feed while leaving
 	// Azure wide open. That fails open by design (too many rows, never zero),
 	// but failing open is silent, so say it out loud here. Keying on the
-	// organization prefix keeps the check precise: a pattern that does not name
-	// the org was never trying to address Azure and gets no warning.
+	// organisation prefix keeps the check precise: a pattern that does not name
+	// any configured org was never trying to address Azure and gets no warning.
 	for _, pattern := range cfg.Notifications.IncludeRepos {
-		if azureGlobMatchesNoProject(pattern, cfg.Organization, cfg.Projects) {
-			cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
-				"notifications.include_repos entry %q names organization %q but matches no configured project — it will be treated as a GitHub pattern and will not narrow Azure",
-				pattern, cfg.Organization))
+		for _, org := range cfg.Organizations {
+			if azureGlobMatchesNoProject(pattern, org.Name, org.Projects) {
+				cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
+					"notifications.include_repos entry %q names organisation %q but matches no configured project — it will be treated as a GitHub pattern and will not narrow Azure",
+					pattern, org.Name))
+			}
 		}
 	}
 
@@ -934,14 +1166,17 @@ func LoadFrom(configPath string) (*Config, error) {
 // entire first TUI session, until the user edited or re-saved the file and
 // LoadFrom's own defaulting finally ran.
 func NewWithPath(org string, projects []string, pollingInterval int, theme string, configPath string) *Config {
-	return &Config{
+	cfg := &Config{
 		Organization:    org,
 		Projects:        projects,
 		PollingInterval: pollingInterval,
 		Theme:           theme,
 		Notifications:   defaultNotificationsConfig(),
+		azureYAMLShape:  "legacy",
 		configPath:      configPath,
 	}
+	cfg.ensureOrganizationsFromLegacy()
+	return cfg
 }
 
 // configurationGuideURL is the link to the GitHub configuration documentation.
@@ -950,36 +1185,67 @@ const configurationGuideURL = "https://github.com/Elpulgo/azdo#configuration"
 // Validate checks if the configuration values are valid.
 //
 // Backend requirement: at least one of Azure or GitHub must be configured.
-// Azure is present when Organization AND Projects are both non-empty. GitHub is
-// present when at least one repo slug is listed. Both may coexist.
+// Azure is present when Organizations has at least one fully-populated entry
+// (or the legacy Organization AND Projects fields are both non-empty). GitHub
+// is present when at least one repo slug is listed. Both may coexist.
 //
-// Half-configured Azure rule: if Organization or Projects is set but not both,
-// that is a user error — both fields are required for a functioning Azure backend.
+// Half-configured Azure rule: if an organisation name is set without projects
+// (or the reverse), that is a user error — both are required for a functioning
+// Azure backend. Multi-organisation configs additionally reject duplicate
+// organisation names and the same project API name appearing under two
+// organisations (detail routing keys on bare project names; see ADR 0003).
 func (c *Config) Validate() error {
-	// --- Backend presence check ---
-	azureHasOrg := c.Organization != ""
-	azureHasProjects := len(c.Projects) > 0
-	azurePartial := azureHasOrg != azureHasProjects // XOR: one set, other not
+	// Allow callers that only populated the legacy fields (setup wizard,
+	// NewWithPath, older tests) to validate without an explicit Organizations
+	// assignment — mirror LoadFrom's normalisation.
+	c.ensureOrganizationsFromLegacy()
 
-	// Half-configured Azure: only one of org/projects is present.
-	// This is only a fatal error when GitHub is NOT configured — a partial
-	// Azure stanza is silently skipped when GitHub carries the config
-	// (HasAzure() returns false so the Azure backend won't be built).
-	if azurePartial && !c.HasGitHub() {
-		if !azureHasOrg {
+	// --- Backend presence check ---
+	if len(c.Organizations) > 0 {
+		for i, org := range c.Organizations {
+			hasName := org.Name != ""
+			hasProjects := len(org.Projects) > 0
+			if hasName != hasProjects {
+				if !c.HasGitHub() {
+					if !hasName {
+						return fmt.Errorf(
+							"organisations[%d]: 'name' is not set in config.yaml\n\n"+
+								"Add your Azure DevOps organisation name:\n\n"+
+								"  organizations:\n"+
+								"    - name: your-org-name\n"+
+								"      projects:\n"+
+								"        - your-project-name\n\n"+
+								"For more details, visit: %s", i, configurationGuideURL)
+					}
+					return fmt.Errorf(
+						"organisations[%d] (%q): no projects configured in config.yaml\n\n"+
+							"Add at least one project:\n\n"+
+							"  organizations:\n"+
+							"    - name: %s\n"+
+							"      projects:\n"+
+							"        - your-project-name\n\n"+
+							"For more details, visit: %s", i, org.Name, org.Name, configurationGuideURL)
+				}
+			}
+		}
+	} else {
+		azureHasOrg := c.Organization != ""
+		azureHasProjects := len(c.Projects) > 0
+		if azureHasOrg != azureHasProjects && !c.HasGitHub() {
+			if !azureHasOrg {
+				return fmt.Errorf(
+					"'organization' is not set in config.yaml\n\n"+
+						"Add your Azure DevOps organisation name to the config file:\n\n"+
+						"  organization: your-org-name\n\n"+
+						"For more details, visit: %s", configurationGuideURL)
+			}
 			return fmt.Errorf(
-				"'organization' is not set in config.yaml\n\n"+
-					"Add your Azure DevOps organization name to the config file:\n\n"+
-					"  organization: your-org-name\n\n"+
+				"no projects configured in config.yaml\n\n"+
+					"Add at least one project to the config file:\n\n"+
+					"  projects:\n"+
+					"    - your-project-name\n\n"+
 					"For more details, visit: %s", configurationGuideURL)
 		}
-		// org is set but projects is empty
-		return fmt.Errorf(
-			"no projects configured in config.yaml\n\n"+
-				"Add at least one project to the config file:\n\n"+
-				"  projects:\n"+
-				"    - your-project-name\n\n"+
-				"For more details, visit: %s", configurationGuideURL)
 	}
 
 	// Require at least one backend.
@@ -988,6 +1254,11 @@ func (c *Config) Validate() error {
 			"no backend configured in config.yaml\n\n"+
 				"Configure at least one of:\n\n"+
 				"  Azure DevOps:\n"+
+				"    organizations:\n"+
+				"      - name: your-org-name\n"+
+				"        projects:\n"+
+				"          - your-project-name\n\n"+
+				"  or the legacy single-organisation form:\n"+
 				"    organization: your-org-name\n"+
 				"    projects:\n"+
 				"      - your-project-name\n\n"+
@@ -998,10 +1269,42 @@ func (c *Config) Validate() error {
 				"For more details, visit: %s", configurationGuideURL)
 	}
 
-	// Validate Azure project names when Azure is configured.
-	for i, p := range c.Projects {
-		if p == "" {
-			return fmt.Errorf("project name at index %d cannot be empty", i)
+	// Validate Azure organisation and project names when Azure is configured.
+	seenOrgNames := make(map[string]int)     // lowercased org name → index
+	seenProjects := make(map[string]string)  // lowercased project → owning org
+	for i, org := range c.Organizations {
+		if org.Name == "" {
+			continue // half-configured entry already handled (or skipped with GitHub)
+		}
+		orgKey := strings.ToLower(org.Name)
+		if prev, ok := seenOrgNames[orgKey]; ok {
+			return fmt.Errorf(
+				"duplicate Azure DevOps organisation %q (organisations[%d] and organisations[%d]) — each organisation may appear only once",
+				org.Name, prev, i)
+		}
+		seenOrgNames[orgKey] = i
+		for j, p := range org.Projects {
+			if p == "" {
+				return fmt.Errorf("organisations[%d] (%q): project name at index %d cannot be empty", i, org.Name, j)
+			}
+			projKey := strings.ToLower(p)
+			if owner, ok := seenProjects[projKey]; ok {
+				return fmt.Errorf(
+					"project %q is configured under both organisation %q and organisation %q — "+
+						"project names must be unique across organisations because detail actions "+
+						"route by project name (rename one project entry or split the configs)",
+					p, owner, org.Name)
+			}
+			seenProjects[projKey] = org.Name
+		}
+	}
+	// Legacy-only path (Organizations empty after ensure failed): still
+	// validate the bare Projects list for empty names.
+	if len(c.Organizations) == 0 {
+		for i, p := range c.Projects {
+			if p == "" {
+				return fmt.Errorf("project name at index %d cannot be empty", i)
+			}
 		}
 	}
 
@@ -1191,25 +1494,58 @@ func (c *Config) Save() error {
 		}
 	}
 
-	// Set all config values
-	v.Set("organization", c.Organization)
+	// Ensure Organizations is populated from legacy fields before choosing
+	// a save shape (setup-wizard configs may only have set Organization).
+	c.ensureOrganizationsFromLegacy()
 
-	// Persist projects in new format when display names are configured
-	if len(c.DisplayNames) > 0 {
-		projectEntries := make([]interface{}, len(c.Projects))
-		for i, p := range c.Projects {
-			if dn, ok := c.DisplayNames[p]; ok {
-				projectEntries[i] = map[string]string{
-					"name":         p,
-					"display_name": dn,
-				}
-			} else {
-				projectEntries[i] = p
+	// Multi-organisation configs always save as organizations:. A single
+	// organisation loaded from (or written as) the legacy keys round-trips
+	// in legacy shape so older configs and older binaries stay compatible.
+	saveAsOrganizations := c.azureYAMLShape == "organizations" || len(c.Organizations) > 1
+	if saveAsOrganizations && len(c.Organizations) > 0 {
+		orgEntries := make([]interface{}, len(c.Organizations))
+		for i, org := range c.Organizations {
+			entry := map[string]interface{}{
+				"name": org.Name,
 			}
+			if len(org.DisplayNames) > 0 {
+				projectEntries := make([]interface{}, len(org.Projects))
+				for j, p := range org.Projects {
+					if dn, ok := org.DisplayNames[p]; ok {
+						projectEntries[j] = map[string]string{
+							"name":         p,
+							"display_name": dn,
+						}
+					} else {
+						projectEntries[j] = p
+					}
+				}
+				entry["projects"] = projectEntries
+			} else {
+				entry["projects"] = org.Projects
+			}
+			orgEntries[i] = entry
 		}
-		v.Set("projects", projectEntries)
+		v.Set("organizations", orgEntries)
 	} else {
-		v.Set("projects", c.Projects)
+		v.Set("organization", c.Organization)
+		// Persist projects in object format when display names are configured.
+		if len(c.DisplayNames) > 0 {
+			projectEntries := make([]interface{}, len(c.Projects))
+			for i, p := range c.Projects {
+				if dn, ok := c.DisplayNames[p]; ok {
+					projectEntries[i] = map[string]string{
+						"name":         p,
+						"display_name": dn,
+					}
+				} else {
+					projectEntries[i] = p
+				}
+			}
+			v.Set("projects", projectEntries)
+		} else {
+			v.Set("projects", c.Projects)
+		}
 	}
 
 	v.Set("polling_interval", c.PollingInterval)
@@ -1239,12 +1575,36 @@ func (c *Config) Save() error {
 		v.Set("github", ghMap)
 	}
 
-	// Write config file
-	if err := v.WriteConfig(); err != nil {
+	// When switching YAML shape, drop the keys of the other shape so a
+	// round-trip cannot leave both forms in the file (LoadFrom rejects that).
+	// Viper has no Unset, so marshal AllSettings after deleting the orphans.
+	drop := []string{}
+	if saveAsOrganizations && len(c.Organizations) > 0 {
+		drop = []string{"organization", "projects", "project"}
+	} else {
+		drop = []string{"organizations"}
+	}
+	if err := writeViperYAML(configPath, v, drop...); err != nil {
 		return fmt.Errorf("failed to write config file: %w", err)
 	}
 
 	return nil
+}
+
+// writeViperYAML writes v's settings to path as YAML, omitting dropKeys.
+// Used by Save because spf13/viper has no Unset and setting a key to nil
+// still emits it (as null), which would leave both Azure config shapes in
+// the file after a shape switch.
+func writeViperYAML(path string, v *viper.Viper, dropKeys ...string) error {
+	settings := v.AllSettings()
+	for _, k := range dropKeys {
+		delete(settings, k)
+	}
+	data, err := yaml.Marshal(settings)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0644)
 }
 
 // UpdateTheme updates the theme in the config and saves it

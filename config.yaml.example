@@ -1,10 +1,28 @@
 # Azure DevOps TUI Configuration
 # Copy this file to ~/.config/azdo-tui/config.yaml and edit the values
 
-# Azure DevOps organization name (required)
+# ── Azure DevOps organisations ───────────────────────────────────────────
+# Prefer the organizations: list when you use more than one Azure DevOps
+# organisation. Lists (pull requests, work items, pipelines, notifications)
+# merge results across every entry the same way they already merge across
+# Azure and GitHub backends. Project API names must be unique across
+# organisations (detail actions route by project name).
+#
+# organizations:
+#   - name: org-a
+#     projects:
+#       - project-one
+#       - name: ugly-api-name
+#         display_name: My Project
+#   - name: org-b
+#     projects:
+#       - project-two
+
+# Legacy single-organisation form (still fully supported). Equivalent to a
+# one-entry organizations: list. Do not set both shapes in the same file.
 organization: your-org-name
 
-# Azure DevOps project name(s) (required)
+# Azure DevOps project name(s) for the legacy single-organisation form.
 # Simple format (API name shown in UI):
 #   projects:
 #     - your-project-name
