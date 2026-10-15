@@ -48,6 +48,11 @@ type State struct {
 	Version   int       `yaml:"version,omitempty"`
 	ActiveTab TabID     `yaml:"active_tab,omitempty"`
 	Tabs      TabsState `yaml:"tabs,omitempty"`
+	// RepoFilterOff records that the user switched the Azure repository
+	// filter off with R. Zero value (absent) means the configured filter
+	// applies, so a fresh or pre-existing state file changes nothing.
+	// Additive — no CurrentVersion bump, same reasoning as TabNotifications.
+	RepoFilterOff bool `yaml:"repo_filter_off,omitempty"`
 }
 
 // TabsState holds per-tab restorable memory. Pipelines is deliberately
