@@ -6,11 +6,37 @@ import (
 	"time"
 )
 
+// buildRepositoryQuery returns the List Builds query fragment that narrows
+// results to one Azure Repos Git repository, or "" when repositoryID is
+// empty. `repositoryType` accompanies `repositoryId` because the API treats
+// the ID as opaque without it; TfsGit is the type of every repository the
+// Git repositories API (ListRepositories) can return, so it is the only type
+// the repository filter can ever resolve to.
+func buildRepositoryQuery(repositoryID string) string {
+	if repositoryID == "" {
+		return ""
+	}
+	return "&repositoryId=" + repositoryID + "&repositoryType=TfsGit"
+}
+
 // ListPipelineRuns retrieves the most recent pipeline runs (builds) for the project
 // top: maximum number of runs to return (typically 25-100)
 // Results are ordered by queue time descending (most recent first)
 func (c *Client) ListPipelineRuns(top int) ([]PipelineRun, error) {
-	path := fmt.Sprintf("/build/builds?api-version=7.1&$top=%d&queryOrder=queueTimeDescending", top)
+	return c.listPipelineRuns(top, "")
+}
+
+// ListPipelineRunsInRepository is ListPipelineRuns narrowed server-side to
+// builds whose source is the given Azure Repos Git repository. It backs the
+// per-project repository filter; the project-wide ListPipelineRuns keeps its
+// behaviour for every other caller.
+func (c *Client) ListPipelineRunsInRepository(repositoryID string, top int) ([]PipelineRun, error) {
+	return c.listPipelineRuns(top, repositoryID)
+}
+
+func (c *Client) listPipelineRuns(top int, repositoryID string) ([]PipelineRun, error) {
+	path := fmt.Sprintf("/build/builds?api-version=7.1&$top=%d&queryOrder=queueTimeDescending%s",
+		top, buildRepositoryQuery(repositoryID))
 
 	body, err := c.get(path)
 	if err != nil {
@@ -44,11 +70,23 @@ func (c *Client) ListPipelineRuns(top int) ([]PipelineRun, error) {
 // this method exists to surface, so an unbounded fetch here would trade one
 // failure mode (hidden backlog) for another (a huge, slow response).
 func (c *Client) ListActivePipelineRuns() ([]PipelineRun, error) {
+	return c.listActivePipelineRuns("")
+}
+
+// ListActivePipelineRunsInRepository is ListActivePipelineRuns narrowed
+// server-side to one Azure Repos Git repository (see
+// ListPipelineRunsInRepository). Both status requests carry the repository
+// narrowing.
+func (c *Client) ListActivePipelineRunsInRepository(repositoryID string) ([]PipelineRun, error) {
+	return c.listActivePipelineRuns(repositoryID)
+}
+
+func (c *Client) listActivePipelineRuns(repositoryID string) ([]PipelineRun, error) {
 	const activePipelineRunsTop = 200
 	var all []PipelineRun
 	for _, status := range []string{"notStarted", "inProgress"} {
-		path := fmt.Sprintf("/build/builds?api-version=7.1&statusFilter=%s&$top=%d&queryOrder=queueTimeDescending",
-			status, activePipelineRunsTop)
+		path := fmt.Sprintf("/build/builds?api-version=7.1&statusFilter=%s&$top=%d&queryOrder=queueTimeDescending%s",
+			status, activePipelineRunsTop, buildRepositoryQuery(repositoryID))
 
 		body, err := c.get(path)
 		if err != nil {
