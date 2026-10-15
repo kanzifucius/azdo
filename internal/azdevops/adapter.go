@@ -169,14 +169,15 @@ func (a *Adapter) Scopes() []string {
 
 // ListPullRequests returns up to top active pull requests across all projects,
 // mapping wire types to neutral types with identity stamped per project.
-// opts is accepted for interface compliance; PR filtering is handled by the
-// REST API's searchCriteria parameters rather than WIQL, so opts fields other
-// than Top are unused at this layer (they will be wired in Task 9).
+// opts.AllRepos bypasses the per-project repository allow-list installed on
+// the MultiClient (the user's R toggle); the zero value honours it. PR
+// filtering is otherwise handled by the REST API's searchCriteria parameters
+// rather than WIQL, so the remaining opts fields are unused at this layer.
 func (a *Adapter) ListPullRequests(top int, opts provider.ListOpts) ([]provider.PullRequest, error) {
 	if a.mc == nil {
 		return nil, fmt.Errorf("no client configured")
 	}
-	wire, err := a.mc.ListPullRequests(top)
+	wire, err := a.mc.ListPullRequestsFiltered(top, opts.AllRepos)
 	if err != nil {
 		return nil, err
 	}
@@ -189,13 +190,12 @@ func (a *Adapter) ListPullRequests(top int, opts provider.ListOpts) ([]provider.
 
 // ListMyPullRequests returns up to top pull requests created by the
 // authenticated user, mapped to neutral types.
-// opts is accepted for interface compliance; additional filtering will be
-// wired in Task 9.
+// opts.AllRepos bypasses the repository allow-list (see ListPullRequests).
 func (a *Adapter) ListMyPullRequests(top int, opts provider.ListOpts) ([]provider.PullRequest, error) {
 	if a.mc == nil {
 		return nil, fmt.Errorf("no client configured")
 	}
-	wire, err := a.mc.ListMyPullRequests(top)
+	wire, err := a.mc.ListMyPullRequestsFiltered(top, opts.AllRepos)
 	if err != nil {
 		return nil, err
 	}
@@ -208,13 +208,12 @@ func (a *Adapter) ListMyPullRequests(top int, opts provider.ListOpts) ([]provide
 
 // ListPullRequestsAsReviewer returns up to top pull requests where the
 // authenticated user is a reviewer, mapped to neutral types.
-// opts is accepted for interface compliance; additional filtering will be
-// wired in Task 9.
+// opts.AllRepos bypasses the repository allow-list (see ListPullRequests).
 func (a *Adapter) ListPullRequestsAsReviewer(top int, opts provider.ListOpts) ([]provider.PullRequest, error) {
 	if a.mc == nil {
 		return nil, fmt.Errorf("no client configured")
 	}
-	wire, err := a.mc.ListPullRequestsAsReviewer(top)
+	wire, err := a.mc.ListPullRequestsAsReviewerFiltered(top, opts.AllRepos)
 	if err != nil {
 		return nil, err
 	}
@@ -505,13 +504,14 @@ func (a *Adapter) AddWorkItemComment(scope string, id int, text string) (*provid
 
 // ListPipelineRuns returns up to top recent pipeline runs across all projects,
 // mapped to neutral types. opts carries neutral filter intent; zero value
-// reproduces the current default behavior. Status filtering from opts will be
-// applied in Task 9.
+// reproduces the default behaviour, honouring any configured repository
+// allow-list, and opts.AllRepos bypasses that allow-list. Status filtering
+// from opts is applied client-side by the pipelines pane.
 func (a *Adapter) ListPipelineRuns(top int, opts provider.ListOpts) ([]provider.PipelineRun, error) {
 	if a.mc == nil {
 		return nil, fmt.Errorf("no client configured")
 	}
-	wire, err := a.mc.ListPipelineRuns(top)
+	wire, err := a.mc.ListPipelineRunsFiltered(top, opts.AllRepos)
 	if err != nil {
 		return nil, err
 	}
