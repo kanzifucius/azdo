@@ -31,6 +31,7 @@ type Poller struct {
 	client   PipelineClient
 	interval time.Duration
 	runCount int
+	listOpts provider.ListOpts
 	stopped  bool
 	mu       sync.RWMutex
 }
@@ -75,6 +76,17 @@ func (p *Poller) SetRunCount(count int) {
 	p.runCount = count
 }
 
+// SetListOpts sets the neutral filter intent passed to every subsequent
+// ListPipelineRuns call. The app uses it to carry the repository filter
+// toggle (ListOpts.AllRepos) into the background refresh so the pipelines
+// pane and the poller always fetch the same set of runs. Zero value is the
+// default: honour any configured filter.
+func (p *Poller) SetListOpts(opts provider.ListOpts) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.listOpts = opts
+}
+
 // Stop stops the poller from making further API calls.
 func (p *Poller) Stop() {
 	p.mu.Lock()
@@ -102,10 +114,11 @@ func (p *Poller) FetchPipelineRuns() tea.Cmd {
 
 	p.mu.RLock()
 	runCount := p.runCount
+	opts := p.listOpts
 	p.mu.RUnlock()
 
 	return func() tea.Msg {
-		runs, err := p.client.ListPipelineRuns(runCount, provider.ListOpts{})
+		runs, err := p.client.ListPipelineRuns(runCount, opts)
 		return PipelineRunsUpdated{
 			Runs: runs,
 			Err:  err,

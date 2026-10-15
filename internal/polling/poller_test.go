@@ -10,15 +10,17 @@ import (
 
 // MockClient implements a minimal interface for testing
 type MockClient struct {
-	Runs         []provider.PipelineRun
-	Err          error
-	CallCount    int
-	RequestedTop int
+	Runs          []provider.PipelineRun
+	Err           error
+	CallCount     int
+	RequestedTop  int
+	RequestedOpts provider.ListOpts
 }
 
-func (m *MockClient) ListPipelineRuns(top int, _ provider.ListOpts) ([]provider.PipelineRun, error) {
+func (m *MockClient) ListPipelineRuns(top int, opts provider.ListOpts) ([]provider.PipelineRun, error) {
 	m.CallCount++
 	m.RequestedTop = top
+	m.RequestedOpts = opts
 	return m.Runs, m.Err
 }
 
@@ -196,6 +198,28 @@ func TestPoller_CustomRunCount(t *testing.T) {
 
 	if client.RequestedTop != 50 {
 		t.Errorf("expected to request 50 runs, got %d", client.RequestedTop)
+	}
+}
+
+func TestPoller_SetListOpts_ForwardedToEveryFetch(t *testing.T) {
+	client := &MockClient{}
+	p := NewPoller(client, 30*time.Second)
+
+	p.FetchPipelineRuns()()
+	if client.RequestedOpts.AllRepos {
+		t.Fatal("default opts must honour the repository filter (AllRepos=false)")
+	}
+
+	p.SetListOpts(provider.ListOpts{AllRepos: true})
+	p.FetchPipelineRuns()()
+	if !client.RequestedOpts.AllRepos {
+		t.Error("SetListOpts(AllRepos=true) must reach the client")
+	}
+
+	p.SetListOpts(provider.ListOpts{})
+	p.FetchPipelineRuns()()
+	if client.RequestedOpts.AllRepos {
+		t.Error("resetting opts must switch the filter back on")
 	}
 }
 
