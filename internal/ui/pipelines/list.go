@@ -37,6 +37,25 @@ type Model struct {
 	activeStatus string
 	statusPicker components.ListPicker
 	allRuns      []provider.PipelineRun
+
+	// fetchOpts is shared by pointer between the Model copies Bubble Tea
+	// hands around and the listview Fetch closure captured at construction,
+	// so SetAllRepos on one copy is seen by every subsequent fetch.
+	fetchOpts *fetchOptions
+}
+
+// fetchOptions carries the per-pane state that shapes every list fetch.
+type fetchOptions struct {
+	// allRepos mirrors provider.ListOpts.AllRepos: true bypasses the Azure
+	// repository filter (the user's R toggle); the zero value honours it.
+	allRepos bool
+}
+
+func (o *fetchOptions) listOpts() provider.ListOpts {
+	if o == nil {
+		return provider.ListOpts{}
+	}
+	return provider.ListOpts{AllRepos: o.allRepos}
 }
 
 // NewModel creates a new pipeline list model with default styles
@@ -93,6 +112,7 @@ func NewModelWithStyles(client provider.Provider, s *styles.Styles) Model {
 		filterFunc = filterPipelineRunMulti
 	}
 
+	fetchOpts := &fetchOptions{}
 	cfg := listview.Config[provider.PipelineRun]{
 		LoadingMessage: "Loading pipeline runs...",
 		EntityName:     "pipeline runs",
@@ -100,7 +120,7 @@ func NewModelWithStyles(client provider.Provider, s *styles.Styles) Model {
 		ToRows:         toRows,
 		ToColumns:      toColumns,
 		Fetch: func() tea.Cmd {
-			return fetchPipelineRuns(client)
+			return fetchPipelineRuns(client, fetchOpts.listOpts())
 		},
 		EnterDetail: func(item provider.PipelineRun, st *styles.Styles, w, h int) (listview.DetailView, tea.Cmd) {
 			d := NewDetailModelWithStyles(client, item, st)
@@ -119,7 +139,23 @@ func NewModelWithStyles(client provider.Provider, s *styles.Styles) Model {
 		viewMode:     ViewList,
 		styles:       s,
 		statusPicker: components.NewListPicker(s),
+		fetchOpts:    fetchOpts,
 	}
+}
+
+// SetAllRepos switches the Azure repository filter off (true) or on (false)
+// for every fetch this pane makes from now on (the r key and Init). The
+// background poller carries the same toggle via polling.Poller.SetListOpts.
+func (m *Model) SetAllRepos(allRepos bool) {
+	if m.fetchOpts == nil {
+		m.fetchOpts = &fetchOptions{}
+	}
+	m.fetchOpts.allRepos = allRepos
+}
+
+// AllRepos reports whether the pane currently bypasses the repository filter.
+func (m Model) AllRepos() bool {
+	return m.fetchOpts != nil && m.fetchOpts.allRepos
 }
 
 // Init initializes the model
@@ -539,13 +575,14 @@ type SetRunsMsg struct {
 	Runs []provider.PipelineRun
 }
 
-// fetchPipelineRuns fetches pipeline runs via the provider.
-func fetchPipelineRuns(client provider.Provider) tea.Cmd {
+// fetchPipelineRuns fetches pipeline runs via the provider. opts carries the
+// pane's repository filter toggle.
+func fetchPipelineRuns(client provider.Provider, opts provider.ListOpts) tea.Cmd {
 	return func() tea.Msg {
 		if client == nil {
 			return pipelineRunsMsg{runs: nil, err: nil}
 		}
-		runs, err := client.ListPipelineRuns(30, provider.ListOpts{})
+		runs, err := client.ListPipelineRuns(30, opts)
 		return pipelineRunsMsg{runs: runs, err: err}
 	}
 }

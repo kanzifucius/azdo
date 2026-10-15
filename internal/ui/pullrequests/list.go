@@ -45,6 +45,25 @@ type Model struct {
 	// succeeded) so subsequent polls cannot hijack the user back into detail.
 	pendingRef            provider.Identity
 	pendingRestoreHandled bool
+
+	// fetchOpts is shared by pointer between the Model copies Bubble Tea
+	// hands around and the listview Fetch closure captured at construction,
+	// so SetAllRepos on one copy is seen by every subsequent fetch.
+	fetchOpts *fetchOptions
+}
+
+// fetchOptions carries the per-pane state that shapes every list fetch.
+type fetchOptions struct {
+	// allRepos mirrors provider.ListOpts.AllRepos: true bypasses the Azure
+	// repository filter (the user's R toggle); the zero value honours it.
+	allRepos bool
+}
+
+func (o *fetchOptions) listOpts() provider.ListOpts {
+	if o == nil {
+		return provider.ListOpts{}
+	}
+	return provider.ListOpts{AllRepos: o.allRepos}
 }
 
 // NewModel creates a new pull request list model with default styles
@@ -102,6 +121,7 @@ func NewModelWithStyles(client provider.Provider, s *styles.Styles) Model {
 		filterFunc = filterPRMulti
 	}
 
+	fetchOpts := &fetchOptions{}
 	cfg := listview.Config[provider.PullRequest]{
 		LoadingMessage: "Loading pull requests...",
 		EntityName:     "pull requests",
@@ -109,7 +129,7 @@ func NewModelWithStyles(client provider.Provider, s *styles.Styles) Model {
 		ToRows:         toRows,
 		ToColumns:      toColumns,
 		Fetch: func() tea.Cmd {
-			return fetchPullRequestsMulti(client)
+			return fetchPullRequestsMulti(client, fetchOpts.listOpts())
 		},
 		EnterDetail: func(item provider.PullRequest, st *styles.Styles, w, h int) (listview.DetailView, tea.Cmd) {
 			d := NewDetailModelWithStyles(client, item, st)
@@ -123,11 +143,36 @@ func NewModelWithStyles(client provider.Provider, s *styles.Styles) Model {
 	}
 
 	return Model{
-		list:     listview.New(cfg, s),
-		client:   client,
-		viewMode: ViewList,
-		styles:   s,
+		list:      listview.New(cfg, s),
+		client:    client,
+		viewMode:  ViewList,
+		styles:    s,
+		fetchOpts: fetchOpts,
 	}
+}
+
+// SetAllRepos switches the Azure repository filter off (true) or on (false)
+// for every fetch this pane makes from now on. It does not refetch; see
+// Refetch.
+func (m *Model) SetAllRepos(allRepos bool) {
+	if m.fetchOpts == nil {
+		m.fetchOpts = &fetchOptions{}
+	}
+	m.fetchOpts.allRepos = allRepos
+}
+
+// AllRepos reports whether the pane currently bypasses the repository filter.
+func (m Model) AllRepos() bool {
+	return m.fetchOpts != nil && m.fetchOpts.allRepos
+}
+
+// Refetch marks the list as loading and returns the command that reloads it
+// with the pane's current fetch options. The pullRequestsMsg handler
+// re-dispatches the "my PRs" / "as reviewer" variant when one is active, so
+// a single entry point covers every PR filter mode.
+func (m Model) Refetch() (Model, tea.Cmd) {
+	m.list = m.list.SetLoading(true)
+	return m, fetchPullRequestsMulti(m.client, m.fetchOpts.listOpts())
 }
 
 // Init initializes the model
@@ -155,20 +200,20 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 		if errors.As(msg.err, &partialErr) {
 			m.allPRs = msg.prs
 			if m.myPRsOnly {
-				return m, fetchMyPullRequestsMulti(m.client)
+				return m, fetchMyPullRequestsMulti(m.client, m.fetchOpts.listOpts())
 			}
 			if m.asReviewerOnly {
-				return m, fetchPullRequestsAsReviewerMulti(m.client)
+				return m, fetchPullRequestsAsReviewerMulti(m.client, m.fetchOpts.listOpts())
 			}
 			m.list = m.list.HandleFetchResult(msg.prs, nil)
 			return m.withRestore(nil)
 		}
 		m.allPRs = msg.prs
 		if m.myPRsOnly {
-			return m, fetchMyPullRequestsMulti(m.client)
+			return m, fetchMyPullRequestsMulti(m.client, m.fetchOpts.listOpts())
 		}
 		if m.asReviewerOnly {
-			return m, fetchPullRequestsAsReviewerMulti(m.client)
+			return m, fetchPullRequestsAsReviewerMulti(m.client, m.fetchOpts.listOpts())
 		}
 		m.list = m.list.HandleFetchResult(msg.prs, msg.err)
 		return m.withRestore(nil)
@@ -219,7 +264,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 				// Mutually exclusive with as-reviewer
 				m.asReviewerOnly = false
 				m.asReviewerPRs = nil
-				return m, fetchMyPullRequestsMulti(m.client)
+				return m, fetchMyPullRequestsMulti(m.client, m.fetchOpts.listOpts())
 			}
 			m.myPRs = nil
 			m.list = m.list.SetItems(m.allPRs)
@@ -230,7 +275,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 			if m.asReviewerOnly {
 				m.myPRsOnly = false
 				m.myPRs = nil
-				return m, fetchPullRequestsAsReviewerMulti(m.client)
+				return m, fetchPullRequestsAsReviewerMulti(m.client, m.fetchOpts.listOpts())
 			}
 			m.asReviewerPRs = nil
 			m.list = m.list.SetItems(m.allPRs)
@@ -704,35 +749,37 @@ type SetPRsMsg struct {
 	PRs []provider.PullRequest
 }
 
-// fetchPullRequestsMulti fetches pull requests from all projects via the provider.
-func fetchPullRequestsMulti(client provider.Provider) tea.Cmd {
+// fetchPullRequestsMulti fetches pull requests from all projects via the
+// provider. opts carries the pane's repository filter toggle.
+func fetchPullRequestsMulti(client provider.Provider, opts provider.ListOpts) tea.Cmd {
 	return func() tea.Msg {
 		if client == nil {
 			return pullRequestsMsg{prs: nil, err: nil}
 		}
-		prs, err := client.ListPullRequests(25, provider.ListOpts{})
+		prs, err := client.ListPullRequests(25, opts)
 		return pullRequestsMsg{prs: prs, err: err}
 	}
 }
 
 // fetchMyPullRequestsMulti fetches pull requests created by the authenticated user.
-func fetchMyPullRequestsMulti(client provider.Provider) tea.Cmd {
+func fetchMyPullRequestsMulti(client provider.Provider, opts provider.ListOpts) tea.Cmd {
 	return func() tea.Msg {
 		if client == nil {
 			return myPullRequestsMsg{prs: nil, err: nil}
 		}
-		prs, err := client.ListMyPullRequests(25, provider.ListOpts{Mine: true})
+		opts.Mine = true
+		prs, err := client.ListMyPullRequests(25, opts)
 		return myPullRequestsMsg{prs: prs, err: err}
 	}
 }
 
 // fetchPullRequestsAsReviewerMulti fetches pull requests where the authenticated user is a reviewer.
-func fetchPullRequestsAsReviewerMulti(client provider.Provider) tea.Cmd {
+func fetchPullRequestsAsReviewerMulti(client provider.Provider, opts provider.ListOpts) tea.Cmd {
 	return func() tea.Msg {
 		if client == nil {
 			return asReviewerPullRequestsMsg{prs: nil, err: nil}
 		}
-		prs, err := client.ListPullRequestsAsReviewer(25, provider.ListOpts{})
+		prs, err := client.ListPullRequestsAsReviewer(25, opts)
 		return asReviewerPullRequestsMsg{prs: prs, err: err}
 	}
 }
