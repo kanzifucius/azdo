@@ -82,9 +82,25 @@ type PipelineRun struct {
 	// differ — e.g. a scheduled or someone-else-triggered run). Reuses the
 	// same minimal Identity projection PullRequest.CreatedBy and
 	// WorkItemComment's CreatedBy already use for other IdentityRef payloads.
-	RequestedFor       Identity `json:"requestedFor"`
-	ProjectName        string   `json:"-"` // Set by MultiClient, not from API
-	ProjectDisplayName string   `json:"-"` // Set by MultiClient, display name for UI
+	RequestedFor Identity `json:"requestedFor"`
+	// Repository is the source repository the build was queued against. The
+	// List Builds API populates it for every build; it is what the
+	// per-project repository filter narrows on server-side (repositoryId),
+	// and its Name is surfaced to the pipelines pane so a repository name can
+	// be searched for and asserted on.
+	Repository         BuildRepository `json:"repository"`
+	ProjectName        string          `json:"-"` // Set by MultiClient, not from API
+	ProjectDisplayName string          `json:"-"` // Set by MultiClient, display name for UI
+}
+
+// BuildRepository is the minimal projection of the List Builds API's
+// repository reference. Type is "TfsGit" for Azure Repos Git repositories;
+// builds sourced from GitHub or other providers carry a different type and
+// an ID that is not an Azure Repos repository ID.
+type BuildRepository struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Type string `json:"type"`
 }
 
 // PipelineDefinition represents a pipeline definition

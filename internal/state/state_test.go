@@ -201,3 +201,46 @@ tabs:
 			got.Tabs.PullRequests.LastDetail)
 	}
 }
+
+// TestState_RepoFilterOff_RoundTripAndOmitted pins the repo_filter_off key:
+// written only when true, absent (and therefore "filter applies") otherwise,
+// and readable from a hand-written file.
+func TestState_RepoFilterOff_RoundTripAndOmitted(t *testing.T) {
+	on := State{Version: CurrentVersion, RepoFilterOff: true}
+	data, err := on.Marshal()
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if !strings.Contains(string(data), "repo_filter_off: true") {
+		t.Errorf("expected repo_filter_off: true in output, got:\n%s", data)
+	}
+	var parsed State
+	if err := parsed.Unmarshal(data); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if !parsed.RepoFilterOff {
+		t.Error("RepoFilterOff did not survive the round trip")
+	}
+
+	off := State{Version: CurrentVersion}
+	data, err = off.Marshal()
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if strings.Contains(string(data), "repo_filter_off") {
+		t.Errorf("zero RepoFilterOff must be omitted, got:\n%s", data)
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.yaml")
+	if err := os.WriteFile(path, []byte("version: 2\nactive_tab: pipelines\nrepo_filter_off: true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !loaded.RepoFilterOff || loaded.ActiveTab != TabPipelines {
+		t.Errorf("Load() = %+v", loaded)
+	}
+}

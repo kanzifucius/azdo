@@ -307,6 +307,27 @@ List methods (`ListPullRequests`, `ListWorkItems`, `ListPipelineRuns`, and the
 and mutation methods take a `scope` string as their first argument so calls can
 be routed to the backend that owns that scope.
 
+`ListOpts.AllRepos` is the one field with a backend-specific home: it bypasses
+the **per-project Azure repository allow-list** (`repos:` on a project entry,
+see `docs/adr/0004-azure-repo-filter-server-side.md`). The zero value honours the filter, so an
+unconfigured project behaves exactly as before and GitHub's adapter ignores the
+field. The filter lives entirely inside `azdevops.MultiClient`: `SetRepoFilters`
+installs the configured names/globs, `ResolveRepoFilters` resolves them to
+repository IDs once per session via `GET {project}/_apis/git/repositories`
+(returning user-facing warnings for names that match nothing, and leaving a
+project that could not be listed to be resolved lazily on its first fetch), and
+the `*Filtered(top, allRepos)` list variants fan out **one request per allowed
+repository** (`searchCriteria.repositoryId` for PRs, `repositoryId` +
+`repositoryType=TfsGit` for builds) so each repository gets its own `$top`
+window. The unfiltered methods the notification sources and metrics call are
+untouched, which is what keeps the Notifications feed independent of the
+allow-list by construction. `cmd/azdo-tui` resolves every organisation's filter
+eagerly and concurrently before the TUI starts and hands the warnings to
+`app.Model.SetRepoFilterWarnings`, which renders them as a banner above the PR
+and pipelines panes. The `R` key flips `Model.repoFilterOff`, pushes it to both
+panes (`SetAllRepos`) and the poller (`SetListOpts`), persists it
+(`state.RepoFilterOff`) and refetches the active pane.
+
 **Neutral domain types** (`internal/provider/types.go`) — `PullRequest`,
 `WorkItem`, `Thread`, `Comment`, `Reviewer`, `PipelineRun`, `Timeline`,
 `Iteration`, `IterationChange`, etc. Every entity carries an **`Identity`**:
@@ -584,7 +605,9 @@ Built-in themes include dark, light, dracula, catppuccin, and others.
 ### 7. Configuration and Auth
 
 **Config** is YAML-based (`~/.config/azdo-tui/config.yaml`) loaded via viper:
-- Azure: organization name + project list (simple strings or objects with display names)
+- Azure: organization name + project list (simple strings or objects with display
+  names and an optional `repos` allow-list; `AzureOrgConfig.RepoFilters` /
+  `Config.RepoFilterFor`)
 - GitHub: `github.repos` (`owner/repo` slugs), plus optional `github.type_prefix`
   and `github.priority_prefix`
 - Polling interval
@@ -666,9 +689,9 @@ guides the user through setup.
 
 ### 8. Navigation State Persistence
 
-A lightweight `internal/state` package persists the last active tab and the most recently opened PR / work item detail to `$XDG_STATE_HOME/azdo-tui/state.yaml` (falling back to `~/.local/state/azdo-tui/state.yaml`). Pipeline detail is intentionally not persisted.
+A lightweight `internal/state` package persists the last active tab, the most recently opened PR / work item detail and the Azure repository-filter toggle to `$XDG_STATE_HOME/azdo-tui/state.yaml` (falling back to `~/.local/state/azdo-tui/state.yaml`). Pipeline detail is intentionally not persisted.
 
-- **`State`** — YAML-tagged struct (`ActiveTab`, `Tabs.PullRequests.LastDetailID`, `Tabs.WorkItems.LastDetailID`) with a `Version` field for forward-compatible schema changes.
+- **`State`** — YAML-tagged struct (`ActiveTab`, `Tabs.PullRequests.LastDetailID`, `Tabs.WorkItems.LastDetailID`, `RepoFilterOff`) with a `Version` field for forward-compatible schema changes. `RepoFilterOff` (`repo_filter_off`, written only when true) records that the user switched the per-project repository allow-list off with `R`; it is additive and needed no version bump, and `ApplyState` honours it unconditionally.
 - **`Store`** — thread-safe wrapper around `State`. `Apply(mutate)` schedules a debounced write (default 500ms) so rapid tab switches coalesce into a single disk write. `Flush()` is synchronous and called on shutdown.
 - **Atomic writes** — `Store` writes to a temp file in the same directory, `fsync`s, then renames over the target, so a crash mid-write never leaves a half-written file.
 - **Restore on startup** — the root model calls `ApplyState` once at boot. Disabled or unknown tabs are ignored. For the PR / work item tabs, a one-shot `pendingDetailID` is consumed on the first populate after launch; if the persisted ID isn't found in the loaded data, the app stays on the list (graceful fallback) and the intent is cleared so polling refreshes can't hijack the user back into a stale detail.
@@ -771,10 +794,11 @@ All endpoints use base URL `https://dev.azure.com/{organization}/` with Basic au
 
 | Feature | Endpoint | Version |
 |---------|----------|---------|
-| List builds | `GET {project}/_apis/build/builds` | 7.1 |
+| List builds | `GET {project}/_apis/build/builds` (per-repository when a `repos:` filter applies: `&repositoryId={id}&repositoryType=TfsGit`) | 7.1 |
 | Build timeline | `GET {project}/_apis/build/builds/{id}/timeline` | 7.1 |
 | Build logs | `GET {project}/_apis/build/builds/{id}/logs/{logId}` | 7.1 |
-| List PRs | `GET {project}/_apis/git/repositories/{repo}/pullrequests` | 7.1 |
+| List repositories | `GET {project}/_apis/git/repositories` (resolves `repos:` names to IDs once per session) | 7.1 |
+| List PRs | `GET {project}/_apis/git/pullrequests` (per-repository when a `repos:` filter applies: `&searchCriteria.repositoryId={id}`) | 7.1 |
 | PR threads | `GET {project}/_apis/git/repositories/{repo}/pullrequests/{id}/threads` | 7.1 |
 | Update PR | `PATCH {project}/_apis/git/repositories/{repo}/pullrequests/{id}` | 7.1 |
 | Work items (WIQL) | `POST {project}/_apis/wit/wiql` | 7.1 |

@@ -79,9 +79,34 @@ Press `m` in the Work Items tab to toggle the "my items" filter. This shows only
 
 You can also press `f` to open the search/filter bar and type to filter by text, or press `T` to filter by tag.
 
+## How do I limit the PR and Pipelines panes to a few repositories?
+
+Add a `repos:` allow-list to the Azure project entry in `config.yaml` (it works under both the `organizations:` list and the legacy `projects:` list):
+
+```yaml
+organizations:
+  - name: org-a
+    projects:
+      - name: platform
+        display_name: Platform
+        repos:
+          - platform-api
+          - infra-*
+```
+
+Entries are repository names, matched case-insensitively; `path.Match` globs (`*`, `?`, `[a-z]`) are accepted. With a filter in place the Pull Requests and Pipelines panes only fetch items from those repositories — the narrowing happens server-side, one request per allowed repository, so a busy project cannot crowd the allowed repositories out of the recent-items window. A `Repos` pill appears in the status bar while the filter applies.
+
+Press `R` on either pane to switch the filter off and see every repository, and `R` again to switch it back on. The choice is remembered in `state.yaml` (`repo_filter_off: true`), so it survives restarts.
+
+A few things to know:
+
+- **Work items and the Notifications feed are not affected.** Work items are not repository-scoped, and the feed has its own, independent narrowing (`notifications.include_repos` / `exclude_repos`) because an allow-list meant to declutter a list pane should not silently hide a review request or a failed build on another repository.
+- **Unknown names warn.** Names are resolved to repository IDs once per session. An entry that matches nothing shows a warning banner above the two panes listing the known repository names; a project whose entries all miss shows nothing for that project (fail closed) until the config is corrected — press `R` to see everything in the meantime. A repository created after start-up is picked up on restart.
+- **Pipelines from GitHub-sourced repositories are hidden** while the filter is on: the builds API narrows by Azure Repos Git repository ID, and a pipeline whose source is a GitHub repository has none.
+
 ## Where is the state file and how do I reset it?
 
-The app persists a small amount of navigation state (last active tab, last opened PR / work item detail) so you resume where you left off. The file lives at:
+The app persists a small amount of navigation state (last active tab, last opened PR / work item detail, and the `R` repository-filter toggle) so you resume where you left off. The file lives at:
 
 - **Linux/macOS**: `$XDG_STATE_HOME/azdo-tui/state.yaml` if set, otherwise `~/.local/state/azdo-tui/state.yaml`
 - **Windows**: `%USERPROFILE%\.local\state\azdo-tui\state.yaml`

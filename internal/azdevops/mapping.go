@@ -112,6 +112,7 @@ func MapPipelineRun(p PipelineRun, scope, scopeDisplay string) provider.Pipeline
 		DefinitionID:   p.Definition.ID,
 		DefinitionName: p.Definition.Name,
 		WebURL:         p.Links.Web.Href,
+		RepositoryName: p.Repository.Name,
 	}
 }
 

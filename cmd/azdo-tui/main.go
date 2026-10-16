@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -373,6 +374,10 @@ func runTUI() error {
 	// CompositeProvider, reusing the existing multi-backend list fan-out and
 	// scope→backend detail routing. Metrics stays bound to the first
 	// organisation's MultiClient (documented follow-up to fan metrics out).
+	// azureClientsWithRepoFilter collects every organisation's MultiClient
+	// that carries a repos allow-list, so their name → ID resolution can run
+	// once, concurrently, before the TUI starts (see resolveRepoFilters).
+	var azureClientsWithRepoFilter []*azdevops.MultiClient
 	if cfg.HasAzure() {
 		multiOrg := cfg.IsMultiOrganization()
 		lookbackDays, sourceToggles, minPollInterval := azureNotificationArgs(cfg.Notifications.Azure)
@@ -400,6 +405,10 @@ func runTUI() error {
 			}
 			if i == 0 || azureMC == nil {
 				azureMC = client
+			}
+			if len(org.RepoFilters) > 0 {
+				client.SetRepoFilters(org.RepoFilters)
+				azureClientsWithRepoFilter = append(azureClientsWithRepoFilter, client)
 			}
 
 			// NewAdapter alone (bare, no notifications store) still satisfies
@@ -489,6 +498,7 @@ func runTUI() error {
 	model := app.NewModel(composite, azureMC, cfg, version, commit)
 	model.SetStateStore(stateStore)
 	model.ApplyState(stateStore.State())
+	model.SetRepoFilterWarnings(resolveRepoFilters(azureClientsWithRepoFilter))
 	p := tea.NewProgram(model, tea.WithAltScreen())
 
 	// Forward OS termination signals to Bubble Tea so the program unwinds
@@ -526,6 +536,37 @@ func runTUI() error {
 	}
 
 	return nil
+}
+
+// resolveRepoFilters resolves every filtered organisation's repository
+// allow-list eagerly and concurrently (one ListRepositories call per filtered
+// project; the HTTP client's 30 s timeout bounds the wait) so unknown
+// repository names surface as a banner before the first fetch rather than as
+// an empty pane. Warnings are concatenated in configuration order. A listing
+// failure is not fatal: MultiClient retries that project's resolution lazily
+// on its first filtered fetch, and the returned warning says so.
+func resolveRepoFilters(clients []*azdevops.MultiClient) []string {
+	if len(clients) == 0 {
+		return nil
+	}
+	perClient := make([][]string, len(clients))
+	var wg sync.WaitGroup
+	for i, client := range clients {
+		wg.Add(1)
+		go func(i int, mc *azdevops.MultiClient) {
+			defer wg.Done()
+			// The error aggregates the listing failures, each of which is
+			// already present in warnings as a user-facing sentence.
+			perClient[i], _ = mc.ResolveRepoFilters()
+		}(i, client)
+	}
+	wg.Wait()
+
+	var warnings []string
+	for _, w := range perClient {
+		warnings = append(warnings, w...)
+	}
+	return warnings
 }
 
 // azureNotificationArgs derives azdevops.NewAdapterWithNotifications's three

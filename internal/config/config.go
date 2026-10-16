@@ -36,6 +36,15 @@ type AzureOrgConfig struct {
 	Name         string            `mapstructure:"name"`
 	Projects     []string          `mapstructure:"projects"`
 	DisplayNames map[string]string `mapstructure:"-"` // API name → display name
+	// RepoFilters maps a project API name to its repository allow-list (the
+	// project entry's `repos:` key). A project absent from the map, or mapped
+	// to an empty list, shows every repository. Entries are trimmed and
+	// deduplicated case-insensitively at parse time; path.Match globs are
+	// permitted and resolved against the project's repository list by
+	// azdevops.MultiClient. Only the pull-request and pipelines panes honour
+	// this list — the notifications feed keeps its own include_repos /
+	// exclude_repos keys and work items are repository-agnostic.
+	RepoFilters map[string][]string `mapstructure:"-"`
 }
 
 // Config holds the application configuration
@@ -44,10 +53,11 @@ type Config struct {
 	// single-organisation Azure fields. Prefer Organizations for new code.
 	// LoadFrom always back-populates these from Organizations[0] (when
 	// present) so existing callers and test fixtures keep working.
-	Organization string            `mapstructure:"organization"`
-	Project      string            `mapstructure:"project"`  // deprecated: use Projects / Organizations
-	Projects     []string          `mapstructure:"projects"` // deprecated: use Organizations
-	DisplayNames map[string]string `mapstructure:"-"`       // API name → display name (first org)
+	Organization string              `mapstructure:"organization"`
+	Project      string              `mapstructure:"project"`  // deprecated: use Projects / Organizations
+	Projects     []string            `mapstructure:"projects"` // deprecated: use Organizations
+	DisplayNames map[string]string   `mapstructure:"-"`        // API name → display name (first org)
+	RepoFilters  map[string][]string `mapstructure:"-"`        // API name → repo allow-list (first org); deprecated mirror
 
 	// Organizations is the canonical list of Azure DevOps organisations.
 	// Empty when Azure is not configured. After LoadFrom this is the
@@ -442,13 +452,20 @@ func sanitizeRepoGlobs(warnings *[]string, key string, patterns []string) []stri
 // that loses its last pattern stops selecting at all and the filter falls back
 // to showing the whole inbox.
 func repoGlobDropEffect(key string, noneLeft bool) string {
-	if strings.HasSuffix(key, "include_repos") {
+	switch {
+	case strings.HasSuffix(key, "include_repos"):
 		if noneLeft {
 			return "no include pattern is left, so the whole inbox is shown"
 		}
 		return "the remaining include patterns still apply"
+	case strings.HasSuffix(key, ".repos"):
+		if noneLeft {
+			return "no entry is left, so every repository in the project is shown"
+		}
+		return "the remaining entries still apply"
+	default:
+		return "nothing is excluded by it"
 	}
-	return "nothing is excluded by it"
 }
 
 // validDisabledPanes lists the pane names that can be disabled.
@@ -552,9 +569,68 @@ func (c *Config) DisplayNameFor(apiName string) string {
 	return apiName
 }
 
+// RepoFilterFor returns the repository allow-list configured for the given
+// project API name, or nil when the project is unfiltered (every repository
+// shows). Searches every organisation, then the legacy RepoFilters mirror.
+func (c *Config) RepoFilterFor(project string) []string {
+	for _, org := range c.Organizations {
+		if repos, ok := org.RepoFilters[project]; ok && len(repos) > 0 {
+			return repos
+		}
+	}
+	if repos, ok := c.RepoFilters[project]; ok && len(repos) > 0 {
+		return repos
+	}
+	return nil
+}
+
+// HasRepoFilter reports whether at least one configured Azure project carries
+// a non-empty repository allow-list. The UI gates the R toggle, its footer
+// hint, the help-modal entry and the status-bar pill on this.
+func (c *Config) HasRepoFilter() bool {
+	for _, org := range c.Organizations {
+		for _, repos := range org.RepoFilters {
+			if len(repos) > 0 {
+				return true
+			}
+		}
+	}
+	if len(c.Organizations) == 0 {
+		for _, repos := range c.RepoFilters {
+			if len(repos) > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// syncLegacyRepoFilters refreshes the deprecated RepoFilters mirror from
+// Organizations[0] after LoadFrom has normalised the canonical lists.
+func (c *Config) syncLegacyRepoFilters() {
+	if len(c.Organizations) == 0 {
+		return
+	}
+	c.RepoFilters = copyRepoFilters(c.Organizations[0].RepoFilters)
+}
+
+// copyRepoFilters deep-copies a project → repo allow-list map, returning nil
+// for an empty input so "no filter" stays a nil map everywhere.
+func copyRepoFilters(src map[string][]string) map[string][]string {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make(map[string][]string, len(src))
+	for k, v := range src {
+		out[k] = append([]string(nil), v...)
+	}
+	return out
+}
+
 // syncLegacyAzureFields copies Organizations[0] into the deprecated
-// Organization/Projects/DisplayNames fields so callers that have not yet
-// migrated keep seeing a consistent view. No-op when Organizations is empty.
+// Organization/Projects/DisplayNames/RepoFilters fields so callers that have
+// not yet migrated keep seeing a consistent view. No-op when Organizations is
+// empty.
 func (c *Config) syncLegacyAzureFields() {
 	if len(c.Organizations) == 0 {
 		return
@@ -570,6 +646,7 @@ func (c *Config) syncLegacyAzureFields() {
 	} else {
 		c.DisplayNames = nil
 	}
+	c.RepoFilters = copyRepoFilters(first.RepoFilters)
 }
 
 // ensureOrganizationsFromLegacy builds a one-entry Organizations slice from
@@ -594,6 +671,7 @@ func (c *Config) ensureOrganizationsFromLegacy() {
 			org.DisplayNames[k] = v
 		}
 	}
+	org.RepoFilters = copyRepoFilters(c.RepoFilters)
 	c.Organizations = []AzureOrgConfig{org}
 }
 
@@ -617,30 +695,42 @@ func (c *Config) TermFor(key, fallback string) string {
 // Returns the list of API names and a map of API name → display name
 // (only for projects that have a different display name).
 func parseProjects(raw []interface{}) ([]string, map[string]string) {
+	projects, displayNames, _ := parseProjectEntries(raw)
+	return projects, displayNames
+}
+
+// parseProjectEntries is parseProjects plus the per-project `repos:`
+// allow-list: object entries may carry `repos: [name, glob, …]`, returned as
+// API name → list. Entries are trimmed and deduplicated case-insensitively;
+// an entry that is empty after trimming is kept so Validate can reject it
+// with a message naming the key, rather than silently vanishing. Projects
+// without a repos key (or with an empty list) are absent from the map, and an
+// all-absent map is returned as nil so "no filter configured" is a nil map.
+func parseProjectEntries(raw []interface{}) ([]string, map[string]string, map[string][]string) {
 	projects := make([]string, 0, len(raw))
 	displayNames := make(map[string]string)
+	repoFilters := make(map[string][]string)
 
 	for _, item := range raw {
-		switch v := item.(type) {
-		case string:
-			projects = append(projects, v)
-		case map[interface{}]interface{}:
-			name, _ := v["name"].(string)
-			if name == "" {
-				continue
-			}
+		if name, ok := item.(string); ok {
 			projects = append(projects, name)
-			if dn, ok := v["display_name"].(string); ok && dn != "" && dn != name {
-				displayNames[name] = dn
-			}
-		case map[string]interface{}:
-			name, _ := v["name"].(string)
-			if name == "" {
-				continue
-			}
-			projects = append(projects, name)
-			if dn, ok := v["display_name"].(string); ok && dn != "" && dn != name {
-				displayNames[name] = dn
+			continue
+		}
+		m, ok := asStringKeyedMap(item)
+		if !ok {
+			continue
+		}
+		name, _ := m["name"].(string)
+		if name == "" {
+			continue
+		}
+		projects = append(projects, name)
+		if dn, ok := m["display_name"].(string); ok && dn != "" && dn != name {
+			displayNames[name] = dn
+		}
+		if rawRepos, ok := m["repos"].([]interface{}); ok {
+			if repos := parseRepoList(rawRepos); len(repos) > 0 {
+				repoFilters[name] = repos
 			}
 		}
 	}
@@ -648,7 +738,33 @@ func parseProjects(raw []interface{}) ([]string, map[string]string) {
 	if len(displayNames) == 0 {
 		displayNames = nil
 	}
-	return projects, displayNames
+	if len(repoFilters) == 0 {
+		repoFilters = nil
+	}
+	return projects, displayNames, repoFilters
+}
+
+// parseRepoList normalises one project's raw `repos:` YAML list: non-string
+// entries are skipped, strings are trimmed, and duplicates (case-insensitive)
+// collapse onto their first occurrence. Empty-after-trim entries survive for
+// Validate to reject.
+func parseRepoList(raw []interface{}) []string {
+	out := make([]string, 0, len(raw))
+	seen := make(map[string]struct{}, len(raw))
+	for _, item := range raw {
+		s, ok := item.(string)
+		if !ok {
+			continue
+		}
+		s = strings.TrimSpace(s)
+		key := strings.ToLower(s)
+		if _, dup := seen[key]; dup && s != "" {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, s)
+	}
+	return out
 }
 
 // asStringKeyedMap normalises a YAML map (Viper may produce
@@ -691,7 +807,7 @@ func parseOrganizations(raw []interface{}) []AzureOrgConfig {
 		org := AzureOrgConfig{Name: name}
 		if rawProjects, ok := m["projects"]; ok {
 			if slice, ok := rawProjects.([]interface{}); ok {
-				org.Projects, org.DisplayNames = parseProjects(slice)
+				org.Projects, org.DisplayNames, org.RepoFilters = parseProjectEntries(slice)
 			}
 		}
 		orgs = append(orgs, org)
@@ -936,10 +1052,11 @@ func LoadFrom(configPath string) (*Config, error) {
 	// which only handles string lists.
 	var parsedProjects []string
 	var parsedDisplayNames map[string]string
+	var parsedRepoFilters map[string][]string
 	hasObjectEntries := false
 	if rawProjects := v.Get("projects"); rawProjects != nil {
 		if rawSlice, ok := rawProjects.([]interface{}); ok {
-			parsedProjects, parsedDisplayNames = parseProjects(rawSlice)
+			parsedProjects, parsedDisplayNames, parsedRepoFilters = parseProjectEntries(rawSlice)
 			// Check if any entry was an object (non-string)
 			for _, item := range rawSlice {
 				if _, isStr := item.(string); !isStr {
@@ -980,6 +1097,7 @@ func LoadFrom(configPath string) (*Config, error) {
 	if len(parsedProjects) > 0 {
 		cfg.Projects = parsedProjects
 		cfg.DisplayNames = parsedDisplayNames
+		cfg.RepoFilters = parsedRepoFilters
 	}
 
 	// Store the config path for saving
@@ -1013,6 +1131,35 @@ func LoadFrom(configPath string) (*Config, error) {
 		cfg.azureYAMLShape = "legacy"
 		cfg.ensureOrganizationsFromLegacy()
 	}
+
+	// Drop malformed path.Match globs from every project's repos: allow-list,
+	// warning rather than failing, exactly as the notifications repo globs
+	// are treated below. The key in the warning names the entry's position
+	// so the user can find it in a multi-organisation file. Both the
+	// canonical Organizations slice and the deprecated first-org mirror are
+	// rewritten so neither can hand an uncompilable pattern to the resolver.
+	for i := range cfg.Organizations {
+		for j, project := range cfg.Organizations[i].Projects {
+			repos, ok := cfg.Organizations[i].RepoFilters[project]
+			if !ok {
+				continue
+			}
+			key := fmt.Sprintf("organizations[%d].projects[%d].repos", i, j)
+			if cfg.azureYAMLShape == "legacy" {
+				key = fmt.Sprintf("projects[%d].repos", j)
+			}
+			sanitized := sanitizeRepoGlobs(&cfg.Warnings, key, repos)
+			if len(sanitized) == 0 {
+				delete(cfg.Organizations[i].RepoFilters, project)
+				continue
+			}
+			cfg.Organizations[i].RepoFilters[project] = sanitized
+		}
+		if len(cfg.Organizations[i].RepoFilters) == 0 {
+			cfg.Organizations[i].RepoFilters = nil
+		}
+	}
+	cfg.syncLegacyRepoFilters()
 
 	// Parse disabled_panes (comma-separated string)
 	if raw := v.GetString("disabled_panes"); raw != "" {
@@ -1270,8 +1417,8 @@ func (c *Config) Validate() error {
 	}
 
 	// Validate Azure organisation and project names when Azure is configured.
-	seenOrgNames := make(map[string]int)     // lowercased org name → index
-	seenProjects := make(map[string]string)  // lowercased project → owning org
+	seenOrgNames := make(map[string]int)    // lowercased org name → index
+	seenProjects := make(map[string]string) // lowercased project → owning org
 	for i, org := range c.Organizations {
 		if org.Name == "" {
 			continue // half-configured entry already handled (or skipped with GitHub)
@@ -1296,6 +1443,13 @@ func (c *Config) Validate() error {
 					p, owner, org.Name)
 			}
 			seenProjects[projKey] = org.Name
+			for _, repo := range org.RepoFilters[p] {
+				if strings.TrimSpace(repo) == "" {
+					return fmt.Errorf(
+						"organisations[%d] (%q): project %q has an empty entry in its repos list — "+
+							"remove it, or remove the repos key to show every repository", i, org.Name, p)
+				}
+			}
 		}
 	}
 	// Legacy-only path (Organizations empty after ensure failed): still
@@ -1304,6 +1458,11 @@ func (c *Config) Validate() error {
 		for i, p := range c.Projects {
 			if p == "" {
 				return fmt.Errorf("project name at index %d cannot be empty", i)
+			}
+			for _, repo := range c.RepoFilters[p] {
+				if strings.TrimSpace(repo) == "" {
+					return fmt.Errorf("project %q has an empty entry in its repos list", p)
+				}
 			}
 		}
 	}
@@ -1505,47 +1664,15 @@ func (c *Config) Save() error {
 	if saveAsOrganizations && len(c.Organizations) > 0 {
 		orgEntries := make([]interface{}, len(c.Organizations))
 		for i, org := range c.Organizations {
-			entry := map[string]interface{}{
-				"name": org.Name,
+			orgEntries[i] = map[string]interface{}{
+				"name":     org.Name,
+				"projects": projectEntriesForSave(org.Projects, org.DisplayNames, org.RepoFilters),
 			}
-			if len(org.DisplayNames) > 0 {
-				projectEntries := make([]interface{}, len(org.Projects))
-				for j, p := range org.Projects {
-					if dn, ok := org.DisplayNames[p]; ok {
-						projectEntries[j] = map[string]string{
-							"name":         p,
-							"display_name": dn,
-						}
-					} else {
-						projectEntries[j] = p
-					}
-				}
-				entry["projects"] = projectEntries
-			} else {
-				entry["projects"] = org.Projects
-			}
-			orgEntries[i] = entry
 		}
 		v.Set("organizations", orgEntries)
 	} else {
 		v.Set("organization", c.Organization)
-		// Persist projects in object format when display names are configured.
-		if len(c.DisplayNames) > 0 {
-			projectEntries := make([]interface{}, len(c.Projects))
-			for i, p := range c.Projects {
-				if dn, ok := c.DisplayNames[p]; ok {
-					projectEntries[i] = map[string]string{
-						"name":         p,
-						"display_name": dn,
-					}
-				} else {
-					projectEntries[i] = p
-				}
-			}
-			v.Set("projects", projectEntries)
-		} else {
-			v.Set("projects", c.Projects)
-		}
+		v.Set("projects", projectEntriesForSave(c.Projects, c.DisplayNames, c.RepoFilters))
 	}
 
 	v.Set("polling_interval", c.PollingInterval)
@@ -1589,6 +1716,34 @@ func (c *Config) Save() error {
 	}
 
 	return nil
+}
+
+// projectEntriesForSave renders a projects list for Save: a plain string per
+// project unless that project carries a display name or a repos allow-list,
+// in which case the object form is written. A list with neither anywhere is
+// returned as a plain []string so an unadorned file round-trips byte-for-byte.
+func projectEntriesForSave(projects []string, displayNames map[string]string, repoFilters map[string][]string) interface{} {
+	if len(displayNames) == 0 && len(repoFilters) == 0 {
+		return projects
+	}
+	entries := make([]interface{}, len(projects))
+	for i, p := range projects {
+		dn, hasDN := displayNames[p]
+		repos := repoFilters[p]
+		if !hasDN && len(repos) == 0 {
+			entries[i] = p
+			continue
+		}
+		entry := map[string]interface{}{"name": p}
+		if hasDN {
+			entry["display_name"] = dn
+		}
+		if len(repos) > 0 {
+			entry["repos"] = append([]string(nil), repos...)
+		}
+		entries[i] = entry
+	}
+	return entries
 }
 
 // writeViperYAML writes v's settings to path as YAML, omitting dropKeys.

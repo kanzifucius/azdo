@@ -145,6 +145,11 @@ type PipelineRun struct {
 	DefinitionID   int
 	DefinitionName string
 	WebURL         string
+	// RepositoryName is the source repository the run was queued against,
+	// when the backend reports one (Azure's List Builds does; empty
+	// otherwise). It lets the pipelines pane's search match on repository
+	// and gives the per-project repository filter something to assert on.
+	RepositoryName string
 }
 
 // Thread is the neutral representation of a pull request comment thread.

@@ -34,6 +34,12 @@ type ListOpts struct {
 	// Top overrides the default result-count limit when non-zero. A zero
 	// value means use the caller-supplied top argument (backwards compatible).
 	Top int
+
+	// AllRepos, when true, ignores any configured Azure repository filter
+	// and lists across every repository of each project. Zero value honours
+	// the filter — the default behaviour for a configured project. Backends
+	// without a repository filter concept ignore this field.
+	AllRepos bool
 }
 
 // NotifOpts carries neutral fetch intent for NotificationSource.List — the

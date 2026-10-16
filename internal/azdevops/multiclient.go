@@ -13,6 +13,14 @@ type MultiClient struct {
 	pat          string
 	clients      map[string]*Client // project name → client
 	displayNames map[string]string  // API name → display name
+
+	// Per-project repository allow-list (see multiclient_repofilter.go).
+	// repoPatterns holds the configured names/globs per filtered project;
+	// repoResolved caches the matched repositories once resolved. Both are
+	// nil when no filter is installed, so a zero MultiClient is unfiltered.
+	repoFilterMu sync.Mutex
+	repoPatterns map[string][]string
+	repoResolved map[string][]resolvedRepo
 }
 
 // NewMultiClient creates clients for each project.
@@ -65,72 +73,11 @@ func (mc *MultiClient) Projects() []string {
 }
 
 // ListPipelineRuns fetches pipeline runs from all projects concurrently,
-// merges and sorts by QueueTime descending.
+// merges and sorts by QueueTime descending. It never applies the repository
+// allow-list — the pipelines pane goes through ListPipelineRunsFiltered for
+// that — so every other caller keeps the project-wide behaviour.
 func (mc *MultiClient) ListPipelineRuns(top int) ([]PipelineRun, error) {
-	type result struct {
-		project string
-		runs    []PipelineRun
-		err     error
-	}
-
-	var wg sync.WaitGroup
-	ch := make(chan result, len(mc.clients))
-
-	for project, client := range mc.clients {
-		wg.Add(1)
-		go func(p string, c *Client) {
-			defer wg.Done()
-			runs, err := c.ListPipelineRuns(top)
-			if err != nil {
-				ch <- result{p, nil, err}
-				return
-			}
-			// Active (queued/running) builds are merged in separately so a
-			// build stuck queued for a long time can never be pushed out of
-			// the recency window covered by top (see
-			// Client.ListActivePipelineRuns). Best-effort: a failure here
-			// doesn't invalidate the recent-runs fetch that already
-			// succeeded.
-			if active, activeErr := c.ListActivePipelineRuns(); activeErr == nil {
-				runs = mergeActiveRuns(runs, active)
-			}
-			ch <- result{p, runs, nil}
-		}(project, client)
-	}
-
-	go func() {
-		wg.Wait()
-		close(ch)
-	}()
-
-	var allRuns []PipelineRun
-	var errs []error
-	for range mc.clients {
-		r := <-ch
-		if r.err != nil {
-			errs = append(errs, r.err)
-			continue
-		}
-		for i := range r.runs {
-			r.runs[i].ProjectName = r.project
-			r.runs[i].ProjectDisplayName = mc.DisplayNameFor(r.project)
-		}
-		allRuns = append(allRuns, r.runs...)
-	}
-
-	if len(errs) == len(mc.clients) {
-		return nil, fmt.Errorf("all projects failed: %v", errs)
-	}
-
-	sort.Slice(allRuns, func(i, j int) bool {
-		return allRuns[i].QueueTime.After(allRuns[j].QueueTime)
-	})
-
-	if len(errs) > 0 {
-		return allRuns, &PartialError{Failed: len(errs), Total: len(mc.clients), Errors: errs}
-	}
-
-	return allRuns, nil
+	return mc.ListPipelineRunsFiltered(top, true)
 }
 
 // mergeActiveRuns appends active runs not already present in recent (by ID)
@@ -232,143 +179,27 @@ func finishTimeOrZero(run PipelineRun) time.Time {
 
 // ListPullRequests fetches PRs from all projects concurrently,
 // tags each with ProjectName, merges and sorts by CreationDate descending.
+// It never applies the repository allow-list (see ListPullRequestsFiltered).
 func (mc *MultiClient) ListPullRequests(top int) ([]PullRequest, error) {
-	type result struct {
-		project string
-		prs     []PullRequest
-		err     error
-	}
-
-	var wg sync.WaitGroup
-	ch := make(chan result, len(mc.clients))
-
-	for project, client := range mc.clients {
-		wg.Add(1)
-		go func(p string, c *Client) {
-			defer wg.Done()
-			prs, err := c.ListPullRequests(top)
-			ch <- result{p, prs, err}
-		}(project, client)
-	}
-
-	go func() {
-		wg.Wait()
-		close(ch)
-	}()
-
-	var allPRs []PullRequest
-	var errs []error
-	for r := range ch {
-		if r.err != nil {
-			errs = append(errs, r.err)
-			continue
-		}
-		for i := range r.prs {
-			r.prs[i].ProjectName = r.project
-			r.prs[i].ProjectDisplayName = mc.DisplayNameFor(r.project)
-		}
-		allPRs = append(allPRs, r.prs...)
-	}
-
-	if len(errs) == len(mc.clients) {
-		return nil, fmt.Errorf("all projects failed: %v", errs)
-	}
-
-	sort.Slice(allPRs, func(i, j int) bool {
-		return allPRs[i].CreationDate.After(allPRs[j].CreationDate)
-	})
-
-	if len(errs) > 0 {
-		return allPRs, &PartialError{Failed: len(errs), Total: len(mc.clients), Errors: errs}
-	}
-
-	return allPRs, nil
+	return mc.ListPullRequestsFiltered(top, true)
 }
 
 // ListMyPullRequests fetches PRs created by the authenticated user from all
 // projects concurrently, tags each with ProjectName, merges and sorts by
-// CreationDate descending.
+// CreationDate descending. It never applies the repository allow-list (see
+// ListMyPullRequestsFiltered).
 func (mc *MultiClient) ListMyPullRequests(top int) ([]PullRequest, error) {
-	// Resolve user ID from any project client (all share the same PAT/org)
-	var userID string
-	for _, client := range mc.clients {
-		id, err := client.GetCurrentUserID()
-		if err != nil {
-			return nil, fmt.Errorf("failed to get current user ID: %w", err)
-		}
-		userID = id
-		break
-	}
-
-	type result struct {
-		project string
-		prs     []PullRequest
-		err     error
-	}
-
-	var wg sync.WaitGroup
-	ch := make(chan result, len(mc.clients))
-
-	for project, client := range mc.clients {
-		wg.Add(1)
-		go func(p string, c *Client) {
-			defer wg.Done()
-			prs, err := c.ListMyPullRequests(userID, top)
-			ch <- result{p, prs, err}
-		}(project, client)
-	}
-
-	go func() {
-		wg.Wait()
-		close(ch)
-	}()
-
-	var allPRs []PullRequest
-	var errs []error
-	for r := range ch {
-		if r.err != nil {
-			errs = append(errs, r.err)
-			continue
-		}
-		for i := range r.prs {
-			r.prs[i].ProjectName = r.project
-			r.prs[i].ProjectDisplayName = mc.DisplayNameFor(r.project)
-		}
-		allPRs = append(allPRs, r.prs...)
-	}
-
-	if len(errs) == len(mc.clients) {
-		return nil, fmt.Errorf("all projects failed: %v", errs)
-	}
-
-	sort.Slice(allPRs, func(i, j int) bool {
-		return allPRs[i].CreationDate.After(allPRs[j].CreationDate)
-	})
-
-	if len(errs) > 0 {
-		return allPRs, &PartialError{Failed: len(errs), Total: len(mc.clients), Errors: errs}
-	}
-
-	return allPRs, nil
+	return mc.ListMyPullRequestsFiltered(top, true)
 }
 
 // ListPullRequestsAsReviewer fetches PRs where the authenticated user is a
 // reviewer from all projects concurrently, tags each with ProjectName, merges
 // and sorts by CreationDate descending. It resolves the authenticated user id
 // itself via Client.GetCurrentUserID; see ListPullRequestsAsReviewerForUser
-// for a variant that accepts an already-resolved id instead.
+// for a variant that accepts an already-resolved id instead. It never applies
+// the repository allow-list (see ListPullRequestsAsReviewerFiltered).
 func (mc *MultiClient) ListPullRequestsAsReviewer(top int) ([]PullRequest, error) {
-	var userID string
-	for _, client := range mc.clients {
-		id, err := client.GetCurrentUserID()
-		if err != nil {
-			return nil, fmt.Errorf("failed to get current user ID: %w", err)
-		}
-		userID = id
-		break
-	}
-
-	return mc.listPullRequestsAsReviewer(userID, top)
+	return mc.ListPullRequestsAsReviewerFiltered(top, true)
 }
 
 // ListPullRequestsAsReviewerForUser is ListPullRequestsAsReviewer's variant
@@ -379,65 +210,11 @@ func (mc *MultiClient) ListPullRequestsAsReviewer(top int) ([]PullRequest, error
 // (this one included) independently racing Client.userID's unsynchronized
 // cache via its own GetCurrentUserID call — see runSourcesConcurrently's doc
 // comment for the race this closes.
+//
+// The notification source must see every repository, so the allow-list is
+// never applied here.
 func (mc *MultiClient) ListPullRequestsAsReviewerForUser(userID string, top int) ([]PullRequest, error) {
-	return mc.listPullRequestsAsReviewer(userID, top)
-}
-
-// listPullRequestsAsReviewer is the shared fan-out body for both
-// ListPullRequestsAsReviewer and ListPullRequestsAsReviewerForUser: fetch
-// each project's reviewer-scoped PRs concurrently, tag with ProjectName,
-// merge and sort by CreationDate descending.
-func (mc *MultiClient) listPullRequestsAsReviewer(userID string, top int) ([]PullRequest, error) {
-	type result struct {
-		project string
-		prs     []PullRequest
-		err     error
-	}
-
-	var wg sync.WaitGroup
-	ch := make(chan result, len(mc.clients))
-
-	for project, client := range mc.clients {
-		wg.Add(1)
-		go func(p string, c *Client) {
-			defer wg.Done()
-			prs, err := c.ListPullRequestsAsReviewer(userID, top)
-			ch <- result{p, prs, err}
-		}(project, client)
-	}
-
-	go func() {
-		wg.Wait()
-		close(ch)
-	}()
-
-	var allPRs []PullRequest
-	var errs []error
-	for r := range ch {
-		if r.err != nil {
-			errs = append(errs, r.err)
-			continue
-		}
-		for i := range r.prs {
-			r.prs[i].ProjectName = r.project
-			r.prs[i].ProjectDisplayName = mc.DisplayNameFor(r.project)
-		}
-		allPRs = append(allPRs, r.prs...)
-	}
-
-	if len(errs) == len(mc.clients) {
-		return nil, fmt.Errorf("all projects failed: %v", errs)
-	}
-
-	sort.Slice(allPRs, func(i, j int) bool {
-		return allPRs[i].CreationDate.After(allPRs[j].CreationDate)
-	})
-
-	if len(errs) > 0 {
-		return allPRs, &PartialError{Failed: len(errs), Total: len(mc.clients), Errors: errs}
-	}
-
-	return allPRs, nil
+	return mc.listPullRequestsAsReviewerFiltered(userID, top, true)
 }
 
 // ListWorkItems fetches work items from all projects concurrently,

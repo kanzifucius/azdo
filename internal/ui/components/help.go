@@ -45,6 +45,7 @@ type HelpModal struct {
 	configPath   string
 	versionInfo  string
 	scopes       []string
+	repoFilters  []string
 	scrollOffset int
 
 	releaseNotes      []version.ReleaseNote
@@ -178,6 +179,26 @@ func (h *HelpModal) SetVersionInfo(info string) {
 // GitHub "owner/repo" repos) listed in the Info section of the help modal.
 func (h *HelpModal) SetScopes(scopes []string) {
 	h.scopes = scopes
+}
+
+// SetRepoFilters sets the per-project Azure repository allow-list summary
+// shown in the Info section, one entry per filtered project (e.g.
+// "My Project → platform-api, infra-*"). Nil or empty hides the line.
+func (h *HelpModal) SetRepoFilters(filters []string) {
+	h.repoFilters = filters
+}
+
+// AddActionBinding appends a binding to the Actions section. Callers that
+// add a pane-gated key (one that only exists for some configurations) use
+// this rather than editing NewHelpModal's default list.
+func (h *HelpModal) AddActionBinding(binding HelpBinding) {
+	for i, section := range h.sections {
+		if section.Title == "Actions" {
+			h.sections[i].Bindings = append(h.sections[i].Bindings, binding)
+			return
+		}
+	}
+	h.AddSection("Actions", []HelpBinding{binding})
 }
 
 // NeedsReleaseNotes reports whether release notes have not yet been requested.
@@ -419,7 +440,7 @@ func (h *HelpModal) bodyLines(contentWidth int) []string {
 		}
 	}
 
-	if h.versionInfo != "" || h.configPath != "" || len(h.scopes) > 0 {
+	if h.versionInfo != "" || h.configPath != "" || len(h.scopes) > 0 || len(h.repoFilters) > 0 {
 		infoValueStyle := lipgloss.NewStyle().
 			Foreground(lipgloss.Color(h.styles.Theme.ForegroundMuted)).
 			Background(lipgloss.Color(h.styles.Theme.BackgroundAlt)).
@@ -429,6 +450,9 @@ func (h *HelpModal) bodyLines(contentWidth int) []string {
 		lines = append(lines, helpSectionStyle.Render("Info"))
 		if len(h.scopes) > 0 {
 			lines = append(lines, infoValueStyle.Render("Scopes: "+strings.Join(h.scopes, ", ")))
+		}
+		if len(h.repoFilters) > 0 {
+			lines = append(lines, infoValueStyle.Render("Repo filter: "+strings.Join(h.repoFilters, "; ")))
 		}
 		if h.versionInfo != "" {
 			lines = append(lines, infoValueStyle.Render("Version: "+h.versionInfo))

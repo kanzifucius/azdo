@@ -119,46 +119,83 @@ func (r *Reviewer) VoteDescription() string {
 	}
 }
 
-// ListPullRequests retrieves active pull requests across all repositories in the project
-// top: maximum number of pull requests to return (typically 25-100)
-// Results are ordered by creation date descending (most recent first)
-func (c *Client) ListPullRequests(top int) ([]PullRequest, error) {
-	path := fmt.Sprintf("/git/pullrequests?api-version=7.1&$top=%d&searchCriteria.status=active", top)
+// RepositoriesResponse represents the API response for listing repositories
+type RepositoriesResponse struct {
+	Count int          `json:"count"`
+	Value []Repository `json:"value"`
+}
 
-	body, err := c.get(path)
+// ListRepositories retrieves every Git repository in the project. It backs
+// the per-project repository filter: configured repository names are
+// resolved to IDs once per session (MultiClient.ResolveRepoFilters) because
+// the pull request and build list APIs only narrow by repository ID.
+func (c *Client) ListRepositories() ([]Repository, error) {
+	body, err := c.get("/git/repositories?api-version=7.1")
 	if err != nil {
-		return nil, fmt.Errorf("failed to list pull requests: %w", err)
+		return nil, fmt.Errorf("failed to list repositories: %w", err)
 	}
 
-	var response PullRequestsResponse
-	err = json.Unmarshal(body, &response)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse Azure DevOps API response for pull requests: %w. "+
+	var response RepositoriesResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		return nil, fmt.Errorf("failed to parse Azure DevOps API response for repositories: %w. "+
 			"This may indicate an API structure change. Please check for updates or report this issue", err)
 	}
 
 	return response.Value, nil
 }
 
+// PullRequestCriteria is the server-side `searchCriteria.*` narrowing shared
+// by the pull request list calls. The zero value lists every active pull
+// request in the project; each non-empty field adds one query parameter, and
+// the fields combine (a creator filter scoped to one repository is a single
+// request).
+type PullRequestCriteria struct {
+	// CreatorID restricts results to pull requests created by this user ID.
+	CreatorID string
+	// ReviewerID restricts results to pull requests where this user ID is a
+	// listed reviewer.
+	ReviewerID string
+	// RepositoryID restricts results to one repository. The API accepts a
+	// single ID, which is why the repository filter fans out one request per
+	// allowed repository rather than passing a list.
+	RepositoryID string
+}
+
+func (c PullRequestCriteria) queryString(top int) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "/git/pullrequests?api-version=7.1&$top=%d&searchCriteria.status=active", top)
+	if c.CreatorID != "" {
+		fmt.Fprintf(&b, "&searchCriteria.creatorId=%s", c.CreatorID)
+	}
+	if c.ReviewerID != "" {
+		fmt.Fprintf(&b, "&searchCriteria.reviewerId=%s", c.ReviewerID)
+	}
+	if c.RepositoryID != "" {
+		fmt.Fprintf(&b, "&searchCriteria.repositoryId=%s", c.RepositoryID)
+	}
+	return b.String()
+}
+
+// ListPullRequests retrieves active pull requests across all repositories in the project
+// top: maximum number of pull requests to return (typically 25-100)
+// Results are ordered by creation date descending (most recent first)
+func (c *Client) ListPullRequests(top int) ([]PullRequest, error) {
+	prs, err := c.ListPullRequestsWithCriteria(top, PullRequestCriteria{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list pull requests: %w", err)
+	}
+	return prs, nil
+}
+
 // ListMyPullRequests retrieves active pull requests created by the given user.
 // creatorID: the Azure DevOps user ID (UUID) of the creator to filter by.
 // top: maximum number of pull requests to return.
 func (c *Client) ListMyPullRequests(creatorID string, top int) ([]PullRequest, error) {
-	path := fmt.Sprintf("/git/pullrequests?api-version=7.1&$top=%d&searchCriteria.status=active&searchCriteria.creatorId=%s", top, creatorID)
-
-	body, err := c.get(path)
+	prs, err := c.ListPullRequestsWithCriteria(top, PullRequestCriteria{CreatorID: creatorID})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list my pull requests: %w", err)
 	}
-
-	var response PullRequestsResponse
-	err = json.Unmarshal(body, &response)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse Azure DevOps API response for pull requests: %w. "+
-			"This may indicate an API structure change. Please check for updates or report this issue", err)
-	}
-
-	return response.Value, nil
+	return prs, nil
 }
 
 // ListPullRequestsAsReviewer retrieves active pull requests where the given
@@ -166,16 +203,25 @@ func (c *Client) ListMyPullRequests(creatorID string, top int) ([]PullRequest, e
 // reviewerID: the Azure DevOps user ID (UUID) of the reviewer to filter by.
 // top: maximum number of pull requests to return.
 func (c *Client) ListPullRequestsAsReviewer(reviewerID string, top int) ([]PullRequest, error) {
-	path := fmt.Sprintf("/git/pullrequests?api-version=7.1&$top=%d&searchCriteria.status=active&searchCriteria.reviewerId=%s", top, reviewerID)
-
-	body, err := c.get(path)
+	prs, err := c.ListPullRequestsWithCriteria(top, PullRequestCriteria{ReviewerID: reviewerID})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list pull requests as reviewer: %w", err)
 	}
+	return prs, nil
+}
+
+// ListPullRequestsWithCriteria retrieves active pull requests narrowed
+// server-side by criteria. The three named list methods above are thin
+// wrappers over it; the repository filter (MultiClient) calls it directly so
+// a creator or reviewer filter can be scoped to a single repository.
+func (c *Client) ListPullRequestsWithCriteria(top int, criteria PullRequestCriteria) ([]PullRequest, error) {
+	body, err := c.get(criteria.queryString(top))
+	if err != nil {
+		return nil, err
+	}
 
 	var response PullRequestsResponse
-	err = json.Unmarshal(body, &response)
-	if err != nil {
+	if err := json.Unmarshal(body, &response); err != nil {
 		return nil, fmt.Errorf("failed to parse Azure DevOps API response for pull requests: %w. "+
 			"This may indicate an API structure change. Please check for updates or report this issue", err)
 	}
