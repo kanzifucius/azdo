@@ -113,6 +113,142 @@ type Model struct {
 	// comment). Its zero value ("") is correct at startup: the pane reports no
 	// message until an `o` outcome sets one.
 	notificationsActionMessage string
+
+	// repoFilterConfigured is cfg.HasRepoFilter() at construction: at least
+	// one Azure project carries a repos allow-list. Every repository-filter
+	// behaviour below (the R key, the pill, the footer hint, the help entry)
+	// is gated on it so an unconfigured setup is byte-identical to before.
+	repoFilterConfigured bool
+	// repoFilterOff is the user's R toggle: true means "show every
+	// repository" for the PR and pipelines panes. Seeded from state.yaml by
+	// ApplyState and persisted on every flip.
+	repoFilterOff bool
+	// repoFilterWarnings are the start-up resolution warnings (unknown
+	// repository names, a project whose entries match nothing, a listing
+	// failure) handed in by cmd/azdo-tui via SetRepoFilterWarnings. Shown as
+	// a banner above the PR and pipelines panes while the config problem
+	// persists, whether or not the filter is currently switched off.
+	repoFilterWarnings []string
+}
+
+// repoFilterLabel is the status-bar pill shown while the repository filter
+// applies to the active pane.
+const repoFilterLabel = "Repos"
+
+// repoFilterActive reports whether the configured repository filter is
+// currently applied: configured and not switched off with R.
+func (m Model) repoFilterActive() bool {
+	return m.repoFilterConfigured && !m.repoFilterOff
+}
+
+// SetRepoFilterWarnings installs the repository-filter resolution warnings
+// rendered above the PR and pipelines panes. Wired up by cmd/azdo-tui after
+// MultiClient.ResolveRepoFilters; tests may omit it.
+func (m *Model) SetRepoFilterWarnings(warnings []string) {
+	m.repoFilterWarnings = warnings
+}
+
+// applyRepoFilterToggle pushes the current repoFilterOff value to the two
+// panes and the poller so every subsequent fetch — the panes' own r key, the
+// background tick and the toggle's immediate refetch — agrees on it.
+func (m *Model) applyRepoFilterToggle() {
+	m.pullRequestsView.SetAllRepos(m.repoFilterOff)
+	m.pipelinesView.SetAllRepos(m.repoFilterOff)
+	if m.poller != nil {
+		m.poller.SetListOpts(provider.ListOpts{AllRepos: m.repoFilterOff})
+	}
+}
+
+// recordRepoFilterToggle persists repoFilterOff. No-op without a store.
+func (m Model) recordRepoFilterToggle() {
+	if m.stateStore == nil {
+		return
+	}
+	off := m.repoFilterOff
+	m.stateStore.Apply(func(s *state.State) {
+		s.Version = state.CurrentVersion
+		s.RepoFilterOff = off
+	})
+}
+
+// canToggleRepoFilter reports whether R should act right now: a filter is
+// configured, the active tab is PRs or pipelines, and that pane is on its
+// list (not a detail, diff or log view, whose context bar owns the keys).
+func (m Model) canToggleRepoFilter() bool {
+	if !m.repoFilterConfigured {
+		return false
+	}
+	switch m.activeTab {
+	case TabPullRequests:
+		return !m.pullRequestsView.HasContextBar()
+	case TabPipelines:
+		return !m.pipelinesView.HasContextBar()
+	default:
+		return false
+	}
+}
+
+// toggleRepoFilter flips the repository filter, persists the new value,
+// pushes it to the panes and poller and refetches the active pane. A refetch
+// is unavoidable: with the filter on, the hidden rows were never fetched, so
+// there is nothing to re-filter client-side.
+func (m Model) toggleRepoFilter() (Model, tea.Cmd) {
+	m.repoFilterOff = !m.repoFilterOff
+	m.applyRepoFilterToggle()
+	m.recordRepoFilterToggle()
+
+	var cmd tea.Cmd
+	switch m.activeTab {
+	case TabPullRequests:
+		m.pullRequestsView, cmd = m.pullRequestsView.Refetch()
+	case TabPipelines:
+		cmd = m.poller.FetchPipelineRuns()
+	}
+	return m, cmd
+}
+
+// repoFilterSummary renders one "Display Name → a, b, c" entry per filtered
+// project for the help modal's Info line, in configuration order.
+func repoFilterSummary(cfg *config.Config) []string {
+	if cfg == nil || !cfg.HasRepoFilter() {
+		return nil
+	}
+	var out []string
+	seen := make(map[string]struct{})
+	for _, org := range cfg.Organizations {
+		for _, project := range org.Projects {
+			if _, done := seen[project]; done {
+				continue
+			}
+			if repos := cfg.RepoFilterFor(project); len(repos) > 0 {
+				seen[project] = struct{}{}
+				out = append(out, cfg.DisplayNameFor(project)+" → "+strings.Join(repos, ", "))
+			}
+		}
+	}
+	for _, project := range cfg.Projects {
+		if _, done := seen[project]; done {
+			continue
+		}
+		if repos := cfg.RepoFilterFor(project); len(repos) > 0 {
+			seen[project] = struct{}{}
+			out = append(out, cfg.DisplayNameFor(project)+" → "+strings.Join(repos, ", "))
+		}
+	}
+	return out
+}
+
+// configureRepoFilterHelp adds the repository-filter entries to a freshly
+// built help modal. Called from NewModel and the ThemeSelectedMsg rebuild.
+func configureRepoFilterHelp(h *components.HelpModal, cfg *config.Config) {
+	if cfg == nil || !cfg.HasRepoFilter() {
+		return
+	}
+	// Worded "pipeline runs" rather than "pipelines" so
+	// RemoveBindingsByDescription("pipelines") cannot delete it when that
+	// pane is disabled — the same trick the `f` line uses.
+	h.AddActionBinding(components.HelpBinding{Key: "R", Description: "Toggle repository filter (PRs / pipeline runs)"})
+	h.SetRepoFilters(repoFilterSummary(cfg))
 }
 
 // SetStateStore attaches a state store to the model so navigation changes
@@ -172,6 +308,11 @@ func (m *Model) ApplyState(s state.State) {
 	if ref := s.Tabs.WorkItems.LastDetail; !ref.IsZero() {
 		m.workItemsView = m.workItemsView.WithPendingDetailRestore(identityFromRef(ref))
 	}
+	// Honoured unconditionally: a true left behind by an earlier session
+	// means a filter added to the config later starts switched off until R
+	// is pressed (the missing pill and the footer hint make that visible).
+	m.repoFilterOff = s.RepoFilterOff
+	m.applyRepoFilterToggle()
 }
 
 // refFromIdentity converts a neutral provider identity into its serializable
@@ -642,6 +783,8 @@ func NewModel(p provider.Provider, mc *azdevops.MultiClient, cfg *config.Config,
 		})
 	}
 
+	configureRepoFilterHelp(helpModal, cfg)
+
 	// Set version info in help modal
 	helpModal.SetVersionInfo(formatVersionInfo(currentVersion, commitHash))
 
@@ -709,27 +852,28 @@ func NewModel(p provider.Provider, mc *azdevops.MultiClient, cfg *config.Config,
 	nv := notifications.NewModelWithStyles(appStyles, notificationMarker(p), cfg)
 
 	return Model{
-		client:              p,
-		metricsClient:       mc,
-		config:              cfg,
-		styles:              appStyles,
-		activeTab:           enabledTabs[0],
-		enabledTabs:         enabledTabs,
-		logo:                logo,
-		pipelinesView:       pipelines.NewModelWithStyles(p, appStyles),
-		pullRequestsView:    pullrequests.NewModelWithStyles(p, appStyles),
-		workItemsView:       workitems.NewModelWithStyles(p, appStyles),
-		metricsView:         mv,
-		notificationsView:   nv,
-		statusBar:           statusBar,
-		helpModal:           helpModal,
-		errorModal:          errorModal,
-		themePicker:         themePicker,
-		poller:              poller,
-		notificationsPoller: notificationsPoller,
-		errorHandler:        errorHandler,
-		currentVersion:      currentVersion,
-		commitHash:          commitHash,
+		client:               p,
+		metricsClient:        mc,
+		config:               cfg,
+		styles:               appStyles,
+		activeTab:            enabledTabs[0],
+		enabledTabs:          enabledTabs,
+		logo:                 logo,
+		pipelinesView:        pipelines.NewModelWithStyles(p, appStyles),
+		pullRequestsView:     pullrequests.NewModelWithStyles(p, appStyles),
+		workItemsView:        workitems.NewModelWithStyles(p, appStyles),
+		metricsView:          mv,
+		notificationsView:    nv,
+		statusBar:            statusBar,
+		helpModal:            helpModal,
+		errorModal:           errorModal,
+		themePicker:          themePicker,
+		poller:               poller,
+		notificationsPoller:  notificationsPoller,
+		errorHandler:         errorHandler,
+		currentVersion:       currentVersion,
+		commitHash:           commitHash,
+		repoFilterConfigured: cfg.HasRepoFilter(),
 	}
 }
 
@@ -915,6 +1059,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.themePicker.SetSize(m.width, m.height)
 			m.themePicker.Show()
 			return m, nil
+		case "R":
+			if m.canToggleRepoFilter() {
+				return m.toggleRepoFilter()
+			}
 		case "1", "2", "3", "4", "5":
 			// Up to five tabs can now be enabled at once (notifications, PR,
 			// work items, pipelines, metrics), so "5" joins the digit set.
@@ -994,6 +1142,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.helpModal = components.NewHelpModal(m.styles)
 		m.helpModal.SetVersionInfo(formatVersionInfo(m.currentVersion, m.commitHash))
 		m.helpModal.SetScopes(displayScopes(m.client, m.config))
+		configureRepoFilterHelp(m.helpModal, m.config)
 		if configPath, err := config.GetPath(); err == nil {
 			m.helpModal.SetConfigPath(configPath)
 		}
@@ -1024,6 +1173,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// deriving NotifOpts/filtering from the same config the rest of the app
 		// uses, rather than reverting to the nil-cfg fallback.
 		m.notificationsView = notifications.NewModelWithStyles(m.styles, notificationMarker(m.client), m.config)
+		// The recreated PR and pipelines panes start with the filter on; push
+		// the user's current toggle back so the refetch below honours it.
+		m.applyRepoFilterToggle()
 
 		// CRITICAL: Set window size for all views before they try to render
 		// Subtract border space (2 width for sides, 2 height for top/bottom borders)
@@ -1413,19 +1565,32 @@ func (m Model) filterLabelForTab() (label string, active bool) {
 		}
 		return "", false
 	case TabPipelines:
+		var labels []string
 		if m.pipelinesView.IsStatusFilterActive() {
-			return "Status: " + m.pipelinesView.ActiveStatus(), true
+			labels = append(labels, "Status: "+m.pipelinesView.ActiveStatus())
+		}
+		if m.repoFilterActive() {
+			labels = append(labels, repoFilterLabel)
+		}
+		if len(labels) > 0 {
+			return strings.Join(labels, " + "), true
 		}
 		return "", false
 	case TabPullRequests:
+		var labels []string
 		switch {
 		case m.pullRequestsView.IsMyPRsActive():
-			return "My PRs", true
+			labels = append(labels, "My PRs")
 		case m.pullRequestsView.IsAsReviewerActive():
-			return "Reviewer", true
-		default:
-			return "", false
+			labels = append(labels, "Reviewer")
 		}
+		if m.repoFilterActive() {
+			labels = append(labels, repoFilterLabel)
+		}
+		if len(labels) > 0 {
+			return strings.Join(labels, " + "), true
+		}
+		return "", false
 	case TabMetrics:
 		if m.metricsView.IsTagFilterActive() {
 			return "Tag: " + m.metricsView.ActiveTag(), true
@@ -1597,6 +1762,7 @@ func (m Model) pullRequestsKeybindings() string {
 		m.styles.Key.Render("f") + m.styles.Description.Render(" search") + sep +
 		m.styles.Key.Render("m") + m.styles.Description.Render(" my PRs") + sep +
 		m.styles.Key.Render("A") + m.styles.Description.Render(" as reviewer") + sep +
+		m.repoFilterKeybinding(sep) +
 		m.styles.Key.Render("esc") + m.styles.Description.Render(" back") + sep +
 		m.styles.Key.Render("?") + m.styles.Description.Render(" help") + sep +
 		m.styles.Key.Render("q") + m.styles.Description.Render(" quit")
@@ -1631,9 +1797,20 @@ func (m Model) pipelinesKeybindings() string {
 		m.styles.Key.Render("enter") + m.styles.Description.Render(" details") + sep +
 		m.styles.Key.Render("f") + m.styles.Description.Render(" search") + sep +
 		m.styles.Key.Render("S") + m.styles.Description.Render(" status") + sep +
+		m.repoFilterKeybinding(sep) +
 		m.styles.Key.Render("esc") + m.styles.Description.Render(" back") + sep +
 		m.styles.Key.Render("?") + m.styles.Description.Render(" help") + sep +
 		m.styles.Key.Render("q") + m.styles.Description.Render(" quit")
+}
+
+// repoFilterKeybinding returns the "R repos" footer fragment (with trailing
+// separator) when a repository filter is configured, and "" otherwise, so
+// the PR and pipelines footers are unchanged for an unconfigured setup.
+func (m Model) repoFilterKeybinding(sep string) string {
+	if !m.repoFilterConfigured {
+		return ""
+	}
+	return m.styles.Key.Render("R") + m.styles.Description.Render(" repos") + sep
 }
 
 // notificationsKeybindings returns the keybindings string for the
@@ -1682,6 +1859,14 @@ func notificationsWarningsBanner(warnings []string) string {
 // banner+"\n\n" would leave a stray leading blank line in front of paneView
 // whenever warnings is empty, which this shape cannot produce.
 func notificationsTabContent(paneView string, warnings []string) string {
+	return paneWithWarnings(paneView, warnings)
+}
+
+// paneWithWarnings is the pane-agnostic form of notificationsTabContent: a
+// warnings banner ahead of paneView when there is one, paneView alone
+// otherwise. The PR and pipelines tabs use it for the repository-filter
+// resolution warnings (Model.repoFilterWarnings).
+func paneWithWarnings(paneView string, warnings []string) string {
 	banner := notificationsWarningsBanner(warnings)
 	if banner == "" {
 		return paneView
@@ -1804,7 +1989,7 @@ func (m Model) View() string {
 		scrollPercent = m.notificationsView.GetScrollPercent()
 		statusMessage = m.notificationsView.GetStatusMessage()
 	case TabPullRequests:
-		content = m.pullRequestsView.View()
+		content = paneWithWarnings(m.pullRequestsView.View(), m.repoFilterWarnings)
 		hasContextBar = m.pullRequestsView.HasContextBar()
 		scrollPercent = m.pullRequestsView.GetScrollPercent()
 		statusMessage = m.pullRequestsView.GetStatusMessage()
@@ -1819,7 +2004,7 @@ func (m Model) View() string {
 		scrollPercent = m.metricsView.GetScrollPercent()
 		statusMessage = m.metricsView.GetStatusMessage()
 	default:
-		content = m.pipelinesView.View()
+		content = paneWithWarnings(m.pipelinesView.View(), m.repoFilterWarnings)
 		hasContextBar = m.pipelinesView.HasContextBar()
 		scrollPercent = m.pipelinesView.GetScrollPercent()
 		statusMessage = m.pipelinesView.GetStatusMessage()
