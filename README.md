@@ -144,6 +144,7 @@ Mix freely: configure Azure, GitHub, or both, and both halves merge into the sam
 ### Pull Requests
 - List view of pull requests with status indicators
 - Filter to show only your created PRs (`m` key) or PRs where you're a reviewer (`A` key)
+- Optional per-project repository allow-list (`repos:` on an Azure project entry) so busy projects only show the repositories you care about; press `R` to switch it off and on
 - Detailed view showing PR information and metadata
 - Vote on PRs directly from the detail view. The picker is backend-aware: Azure exposes the full five-level scale (approve, approve with suggestions, wait for author, reject, reset), while GitHub offers just Approve / Request changes to match its review model
 - **Code review**: Diff viewer with file-by-file navigation
@@ -164,6 +165,7 @@ Mix freely: configure Azure, GitHub, or both, and both halves merge into the sam
 - View recent pipeline runs in a sortable table
 - Color-coded status indicators (✓ Success, ✗ Failed, ● Running, ○ Queued)
 - Filter by status (`S` key)
+- Honours the same per-project repository allow-list as the Pull Requests pane (`repos:`, toggled with `R`)
 - Live auto-refresh with configurable polling interval
 - Connection status indicator in footer
 - Hierarchical detail view with stages, jobs, and tasks
@@ -278,6 +280,13 @@ projects:
 #     - name: ugly-api-project-name-2
 #       display_name: My Project 2
 
+# With a repository allow-list (PR and Pipelines panes only; toggle with R):
+#   projects:
+#     - name: your-project-name
+#       repos:
+#         - platform-api
+#         - infra-*
+
 # ── GitHub (optional; required only if you use GitHub) ───────────────────
 # One or more "owner/repo" slugs. Listing at least one enables the GitHub
 # backend. Issues become work items, PRs become pull requests, and Actions
@@ -361,6 +370,7 @@ theme: dark
 - `organizations`: List of Azure DevOps organisations. Each entry has `name` and `projects` (same project entry shapes as below). Prefer this when you use more than one organisation. Project API names must be unique across organisations.
 - `organization` / `projects`: Legacy single-organisation form. Still fully supported; equivalent to a one-entry `organizations` list. Do not set both shapes in the same file.
 - `projects` entries: each can be a plain string or an object with `name` and `display_name` fields. The `display_name` is shown in the TUI while the `name` is used for API calls.
+- `repos` (on a project entry, optional): allow-list of Azure Repos Git repository names for that project. When set, the **Pull Requests** and **Pipelines** panes only show items from those repositories; work items and the Notifications feed are unaffected (the feed is governed separately by `notifications.include_repos` / `exclude_repos`). Names are matched case-insensitively and may be `path.Match` globs (`infra-*`). Names are resolved to repository IDs once per session, so a repository created after start-up is picked up on restart. An entry that matches nothing shows a warning banner above the two panes; a project whose entries all miss shows nothing for that project until the config is corrected. Press `R` to switch the filter off and on — the choice is remembered in the [state file](#state-file). While the filter is on, a `Repos` pill is shown in the status bar and the search bar's matched/total counts reflect the filtered fetch. Pipelines sourced from GitHub or other non-Azure-Repos repositories are hidden while the filter is on. Works under both the `organizations:` and legacy `projects:` shapes.
 - `github.repos`: List of GitHub `owner/repo` slugs. Listing at least one enables the GitHub backend.
 - `github.type_prefix`: Label prefix used to derive a work item's type from GitHub issue labels (optional, default: `type:`). A label like `type:bug` maps to Bug; recognised values are bug, task, story / user story, feature, epic, issue. An unrecognised value (e.g. `type:chore`) is kept as a tag instead.
 - `github.priority_prefix`: Label prefix used to derive priority from GitHub issue labels (optional, default: `priority:`). Accepts `p1`–`p4` or bare `1`–`4`; anything else is kept as a tag.
@@ -640,7 +650,7 @@ See `example-theme.json` in the repository for a complete template with all avai
 
 ### State File
 
-The application persists a small amount of navigation state between runs (last active tab, last opened PR / work item detail) so you land back where you left off. The file is written to:
+The application persists a small amount of navigation state between runs (last active tab, last opened PR / work item detail, and whether the Azure repository filter was switched off with `R` — `repo_filter_off: true`) so you land back where you left off. A `repo_filter_off: true` left behind by an earlier session also applies to a `repos:` allow-list added to the config later: the filter starts switched off until you press `R` (the missing `Repos` pill and the `R repos` footer hint make that visible). The file is written to:
 
 - **Linux/macOS**: `$XDG_STATE_HOME/azdo-tui/state.yaml` if set, otherwise `~/.local/state/azdo-tui/state.yaml`
 - **Windows**: `%USERPROFILE%\.local\state\azdo-tui\state.yaml`
@@ -781,6 +791,7 @@ To create a token:
 | `T` | Filter by tag (work items) |
 | `s` | Filter by state (work items) |
 | `S` | Filter by status (pipelines) |
+| `R` | Toggle the per-project repository filter (PRs / pipeline runs) — only shown when a project has a `repos:` allow-list; remembered between runs |
 | `esc` | Go back / dismiss search |
 | `?` | Toggle help modal |
 | `t` | Select theme |

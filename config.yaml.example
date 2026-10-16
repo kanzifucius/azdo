@@ -14,9 +14,25 @@
 #       - project-one
 #       - name: ugly-api-name
 #         display_name: My Project
+#         repos:                 # optional per-project repository allow-list
+#           - platform-api
+#           - infra-*
 #   - name: org-b
 #     projects:
 #       - project-two
+#
+# repos: (optional, per project) restricts the Pull Requests and Pipelines
+# panes to the listed Azure Repos Git repositories. Entries are repository
+# names, matched case-insensitively; path.Match globs (*, ?, [a-z]) are
+# accepted. Work items and the Notifications feed are not affected -- the
+# feed is governed separately by notifications.include_repos /
+# exclude_repos. Names are resolved to repository IDs once per session, so a
+# repository created after start-up is picked up on restart. An entry that
+# matches nothing produces a warning banner above the two panes; a project
+# whose entries all miss shows nothing for that project until the config is
+# fixed. Press R in the TUI to switch the filter off and on (remembered
+# between runs in state.yaml). Pipelines sourced from GitHub or other
+# non-Azure-Repos repositories are hidden while the filter is on.
 
 # Legacy single-organisation form (still fully supported). Equivalent to a
 # one-entry organizations: list. Do not set both shapes in the same file.
@@ -31,6 +47,13 @@ organization: your-org-name
 #     - name: ugly-api-project-name
 #       display_name: My Project
 #     - simple-project
+# With a repository allow-list (see the repos: notes above; the key works the
+# same way here):
+#   projects:
+#     - name: your-project-name
+#       repos:
+#         - platform-api
+#         - infra-*
 # Multiple projects (shows combined view with "Project" column):
 projects:
   - your-project-name
