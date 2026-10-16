@@ -21,12 +21,48 @@ var team = []azdevops.Identity{
 // demoUserID is the ID returned by the mock connectionData endpoint.
 const demoUserID = "a1b2c3d4-0001-4000-8000-000000000001" // Alex Chen
 
-// Repository IDs used by both projects.
+// Repository IDs used by both projects. Each project has a second, quieter
+// repository so the per-project repository filter (repos: on a project
+// entry) has something to hide: Nexus's demo config allows nexus-platform
+// only, so the nexus-infra builds appear only after pressing R.
 const (
-	repoIDNexus   = "repo-nexus-0001"
-	repoNameNexus = "nexus-platform"
-	repoIDHorizon = "repo-horizon-0001"
+	repoIDNexus        = "repo-nexus-0001"
+	repoNameNexus      = "nexus-platform"
+	repoIDNexusInfra   = "repo-nexus-0002"
+	repoNameNexusInfra = "nexus-infra"
+	repoIDHorizon      = "repo-horizon-0001"
+	repoNameHorizon    = "horizon-app"
+	repoIDHorizonDocs  = "repo-horizon-0002"
+	repoNameHorizonDoc = "horizon-docs"
 )
+
+// mockRepositoriesFor returns the Git repositories of the given API project,
+// as GET /{project}/_apis/git/repositories would. An unknown project returns
+// both projects' repositories so direct calls keep working in tests.
+func mockRepositoriesFor(project string) []azdevops.Repository {
+	nexus := []azdevops.Repository{
+		{ID: repoIDNexus, Name: repoNameNexus},
+		{ID: repoIDNexusInfra, Name: repoNameNexusInfra},
+	}
+	horizon := []azdevops.Repository{
+		{ID: repoIDHorizon, Name: repoNameHorizon},
+		{ID: repoIDHorizonDocs, Name: repoNameHorizonDoc},
+	}
+	switch project {
+	case projectNexus:
+		return nexus
+	case projectHorizon:
+		return horizon
+	default:
+		return append(nexus, horizon...)
+	}
+}
+
+// buildRepo is the List Builds repository reference for one of the demo
+// repositories (always TfsGit — Azure Repos Git).
+func buildRepo(id, name string) azdevops.BuildRepository {
+	return azdevops.BuildRepository{ID: id, Name: name, Type: "TfsGit"}
+}
 
 // now anchors all timestamps so data looks recent regardless of when demo runs.
 var now = time.Now()
@@ -441,6 +477,7 @@ func mockPipelineRuns() []azdevops.PipelineRun {
 	return []azdevops.PipelineRun{
 		{
 			ID: 8001, BuildNumber: "20240315.1", Status: "completed", Result: "succeeded",
+			Repository: buildRepo(repoIDNexus, repoNameNexus),
 			SourceBranch: "refs/heads/main", SourceVersion: "a3f1c2e",
 			QueueTime: hoursAgo(2), StartTime: &startTime1, FinishTime: &finishTime1,
 			RequestedFor: team[2],
@@ -450,6 +487,7 @@ func mockPipelineRuns() []azdevops.PipelineRun {
 		},
 		{
 			ID: 8002, BuildNumber: "20240315.2", Status: "completed", Result: "failed",
+			Repository: buildRepo(repoIDNexus, repoNameNexus),
 			SourceBranch: "refs/heads/feature/auth-refactor", SourceVersion: "b7d4e5f",
 			QueueTime: hoursAgo(3), StartTime: &startTime2, FinishTime: &finishTime2,
 			RequestedFor: team[0], // the demo user's branch — feeds the CI-failed notification source
@@ -459,6 +497,7 @@ func mockPipelineRuns() []azdevops.PipelineRun {
 		},
 		{
 			ID: 8003, BuildNumber: "20240315.3", Status: "completed", Result: "succeeded",
+			Repository: buildRepo(repoIDNexusInfra, repoNameNexusInfra),
 			SourceBranch: "refs/heads/main", SourceVersion: "c8f9a0b",
 			QueueTime: hoursAgo(5), StartTime: &startTime3, FinishTime: &finishTime3,
 			RequestedFor: team[1],
@@ -468,6 +507,7 @@ func mockPipelineRuns() []azdevops.PipelineRun {
 		},
 		{
 			ID: 8004, BuildNumber: "20240315.4", Status: "inProgress", Result: "",
+			Repository: buildRepo(repoIDNexus, repoNameNexus),
 			SourceBranch: "refs/heads/feature/rate-limiting", SourceVersion: "d1e2f3a",
 			QueueTime: hoursAgo(1), StartTime: &startTime4, FinishTime: nil,
 			RequestedFor: team[3],
@@ -477,6 +517,7 @@ func mockPipelineRuns() []azdevops.PipelineRun {
 		},
 		{
 			ID: 8005, BuildNumber: "20240315.1", Status: "completed", Result: "succeeded",
+			Repository: buildRepo(repoIDHorizon, repoNameHorizon),
 			SourceBranch: "refs/heads/main", SourceVersion: "e4f5a6b",
 			QueueTime: hoursAgo(8), StartTime: &startTime5, FinishTime: &finishTime5,
 			RequestedFor: team[5],
@@ -486,6 +527,7 @@ func mockPipelineRuns() []azdevops.PipelineRun {
 		},
 		{
 			ID: 8006, BuildNumber: "20240315.2", Status: "completed", Result: "partiallySucceeded",
+			Repository: buildRepo(repoIDHorizon, repoNameHorizon),
 			SourceBranch: "refs/heads/feature/dark-mode", SourceVersion: "f7a8b9c",
 			QueueTime: hoursAgo(10), StartTime: &startTime6, FinishTime: &finishTime6,
 			RequestedFor: team[5],
@@ -495,6 +537,7 @@ func mockPipelineRuns() []azdevops.PipelineRun {
 		},
 		{
 			ID: 8007, BuildNumber: "20240315.3", Status: "completed", Result: "succeeded",
+			Repository: buildRepo(repoIDHorizon, repoNameHorizon),
 			SourceBranch: "refs/heads/main", SourceVersion: "a0b1c2d",
 			QueueTime: hoursAgo(12), StartTime: &startTime7, FinishTime: &finishTime7,
 			RequestedFor: team[4],
@@ -504,6 +547,7 @@ func mockPipelineRuns() []azdevops.PipelineRun {
 		},
 		{
 			ID: 8008, BuildNumber: "20240314.5", Status: "completed", Result: "failed",
+			Repository: buildRepo(repoIDHorizon, repoNameHorizon),
 			SourceBranch: "refs/heads/fix/table-sort-persist", SourceVersion: "b3c4d5e",
 			QueueTime: hoursAgo(6), StartTime: &startTime8, FinishTime: &finishTime8,
 			RequestedFor: team[0], // Alex re-ran the failed E2E job — second CI-failed notification
@@ -513,6 +557,7 @@ func mockPipelineRuns() []azdevops.PipelineRun {
 		},
 		{
 			ID: 8009, BuildNumber: "20240314.4", Status: "completed", Result: "succeeded",
+			Repository: buildRepo(repoIDNexusInfra, repoNameNexusInfra),
 			SourceBranch: "refs/heads/main", SourceVersion: "c5d6e7f",
 			QueueTime: hoursAgo(14), StartTime: &startTime9, FinishTime: &finishTime9,
 			RequestedFor: team[2],
@@ -522,6 +567,7 @@ func mockPipelineRuns() []azdevops.PipelineRun {
 		},
 		{
 			ID: 8010, BuildNumber: "20240314.3", Status: "completed", Result: "succeeded",
+			Repository: buildRepo(repoIDHorizonDocs, repoNameHorizonDoc),
 			SourceBranch: "refs/heads/main", SourceVersion: "d7e8f9a",
 			QueueTime: hoursAgo(16), StartTime: &startTime10, FinishTime: &finishTime10,
 			RequestedFor: team[1],

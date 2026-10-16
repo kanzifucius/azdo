@@ -25,6 +25,11 @@ func newMockHandler() http.Handler {
 	// Pull requests list
 	mux.HandleFunc("/{project}/git/pullrequests", handlePullRequests)
 
+	// Repository list (exact path; the repository filter resolves configured
+	// names to IDs through it). The trailing-slash pattern below handles the
+	// per-repository sub-resources.
+	mux.HandleFunc("/{project}/git/repositories", handleRepositories)
+
 	// PR detail endpoints: threads, iterations, changes, file content
 	// These all start with /git/repositories/
 	mux.HandleFunc("/{project}/git/repositories/", handleGitRepositories)
@@ -84,7 +89,24 @@ func handlePullRequests(w http.ResponseWriter, r *http.Request) {
 		prs = filtered
 	}
 
+	// The per-project repository filter narrows via
+	// searchCriteria.repositoryId, one request per allowed repository.
+	if repoID := r.URL.Query().Get("searchCriteria.repositoryId"); repoID != "" {
+		var filtered []azdevops.PullRequest
+		for _, pr := range prs {
+			if pr.Repository.ID == repoID {
+				filtered = append(filtered, pr)
+			}
+		}
+		prs = filtered
+	}
+
 	writeJSON(w, azdevops.PullRequestsResponse{Count: len(prs), Value: prs})
+}
+
+func handleRepositories(w http.ResponseWriter, r *http.Request) {
+	repos := mockRepositoriesFor(r.PathValue("project"))
+	writeJSON(w, azdevops.RepositoriesResponse{Count: len(repos), Value: repos})
 }
 
 func handleGitRepositories(w http.ResponseWriter, r *http.Request) {
@@ -250,6 +272,19 @@ func handleWorkItemTypeStates(w http.ResponseWriter, r *http.Request) {
 
 func handleBuilds(w http.ResponseWriter, r *http.Request) {
 	runs := mockPipelineRunsFor(r.PathValue("project"))
+
+	// The per-project repository filter narrows via repositoryId (with
+	// repositoryType=TfsGit); mirror the real API's narrowing.
+	if repoID := r.URL.Query().Get("repositoryId"); repoID != "" {
+		var filtered []azdevops.PipelineRun
+		for _, run := range runs {
+			if run.Repository.ID == repoID {
+				filtered = append(filtered, run)
+			}
+		}
+		runs = filtered
+	}
+
 	writeJSON(w, azdevops.PipelineRunsResponse{Count: len(runs), Value: runs})
 }
 

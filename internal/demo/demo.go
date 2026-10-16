@@ -51,6 +51,14 @@ func Run(version, commit string) error {
 		c.SetUserID(demoUserID)
 	}
 
+	// Showcase the per-project repository filter: Nexus allows only its main
+	// repository, so the nexus-infra builds are hidden until R is pressed.
+	// Mirrors runTUI: install on the client, resolve eagerly, hand warnings
+	// (none expected here) to the model below.
+	repoFilters := map[string][]string{projectNexus: {repoNameNexus}}
+	client.SetRepoFilters(repoFilters)
+	repoFilterWarnings, _ := client.ResolveRepoFilters()
+
 	// Create config with a temp path so theme changes don't touch the real config.
 	// This allows demo mode to work without any prior setup.
 	tmpDir, err := os.MkdirTemp("", "azdo-demo-*")
@@ -68,6 +76,7 @@ func Run(version, commit string) error {
 
 	cfg := config.NewWithPath(demoOrg, projects, demoPollingInterval, "dracula", filepath.Join(tmpDir, "config.yaml"))
 	cfg.DisplayNames = displayNames
+	cfg.Organizations[0].RepoFilters = repoFilters
 	enableDemoMetrics(cfg)
 
 	// Seed synthetic sprint history so the metrics tab's Trends view has data.
@@ -93,6 +102,7 @@ func Run(version, commit string) error {
 		azdevops.DefaultNotificationSourceToggles(), 0)
 	composite := provider.NewCompositeProvider(adapter)
 	model := app.NewModel(composite, client, cfg, version+" (demo)", commit)
+	model.SetRepoFilterWarnings(repoFilterWarnings)
 	p := tea.NewProgram(model, tea.WithAltScreen())
 
 	if _, err := p.Run(); err != nil {
